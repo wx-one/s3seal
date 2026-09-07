@@ -1,0 +1,8 @@
+# what the build makes
+build/
+
+# what a running proxy keeps - and two of these are secrets
+var/
+*.key
+seed
+credentials
