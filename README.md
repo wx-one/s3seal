@@ -114,20 +114,42 @@ noise — which is the point, and also the risk.
 Against a MinIO in a container on loopback, so the absolute figures say more
 about this machine than about anybody's production. The ratios are the point.
 
+The honest number is a long transfer measured while bytes are actually moving,
+with the upstream's final commit left out of the clock — 10 GB in one PUT:
+
+| 10 GB PUT       | during transfer |
+|-----------------|-----------------|
+| upstream direct | 884 MB/s |
+| through s3seal  | **605 MB/s** |
+
+That is 68% of the wire, for a body that is framed, encrypted with AES-256-GCM
+and checksummed with CRC-64/NVME on the way through. The sealing stage is the
+ceiling: it is busy the whole time but only ~42% of that is computing, so the
+next step is to seal several frames in parallel rather than one at a time.
+
+Short objects are dominated by connection setup and by which ETag mode is in
+force, so they are worth reading as a pair:
+
 |                       | 64 MB | 256 MB |
 |-----------------------|-------|--------|
-| write, upstream       | 460 MB/s | 541 MB/s |
-| write, through s3seal | 249 MB/s | 260 MB/s |
-| read, upstream        | 854 MB/s | 1056 MB/s |
-| read, through s3seal  | 542 MB/s | 348 MB/s |
-| **4 kB range**        | **3.1 ms** | **3.0 ms** |
+| write, upstream       | 438 MB/s | 569 MB/s |
+| write, s3seal `md5`    | 244 MB/s | 251 MB/s |
+| write, s3seal `opaque` | 391 MB/s | 447 MB/s |
+| read, upstream        | 1095 MB/s | 774 MB/s |
+| read, through s3seal  | 684 MB/s | 383 MB/s |
+| **4 kB range**        | **3.0 ms** | **3.8 ms** |
 
-The last row is the design in one number. A 4 kB range costs the same out of
-a 256 MB object as out of a 64 MB one, because it fetches one frame and opens
-one frame. The whole-object read behind it went from 0.08 s to 0.25 s over the
-same step — so against a design that seals the body as a single AEAD blob and
-must fetch all of it to reach the middle, the gap is 25x at 64 MB and **85x at
-256 MB**, and it keeps growing.
+`S3SEAL_ETAG=md5` buys a plaintext-MD5 ETag by holding the whole part to hash
+it; `opaque` streams straight through and returns an ETag that is a digest but
+not an MD5 — which S3 itself permits, and which is what every server-side
+encrypted object on AWS already returns.
+
+The last row is the design in one number. A 4 kB range costs the same out of a
+256 MB object as out of a 64 MB one, because it fetches one frame and opens one
+frame. The whole-object read behind it grows with the object — so against a
+design that seals the body as a single AEAD blob and must fetch all of it to
+reach the middle, the gap is **20x at 64 MB and 92x at 256 MB**, and it keeps
+growing.
 
 Framing costs **0.038%** on the wire: 25 bytes per 64 KiB frame.
 
