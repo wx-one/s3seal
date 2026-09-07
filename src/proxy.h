@@ -164,6 +164,11 @@ typedef struct s3seal_push_t {
   double sealing;
   unsigned long long parks;
 
+  /** And where the sealing stage's own time goes: reading, computing, writing. */
+  double sealRead;
+  double sealWork;
+  double sealWrite;
+
   /**
    * Three stages, two pipes.
    *

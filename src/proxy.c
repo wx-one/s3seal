@@ -1221,20 +1221,29 @@ static void sealRun(s3seal_push_t *how) {
     if (want > S3SEAL_FRAME)
       want = S3SEAL_FRAME;
 
-    while (got < want) {
+    {
+      double at = s3seal_clock();
 
-      ssize_t piece = read(how->fromPlain, how->gathering + got, want - got);
+      while (got < want) {
 
-      if (piece <= 0) {
-        how->broke = 1;
-        break;
+        ssize_t piece = read(how->fromPlain, how->gathering + got, want - got);
+
+        if (piece <= 0) {
+          how->broke = 1;
+          break;
+        }
+
+        got += (size_t)piece;
       }
 
-      got += (size_t)piece;
+      how->sealRead += s3seal_clock() - at;
     }
 
     if (how->broke)
       break;
+
+    {
+      double at = s3seal_clock();
 
     head = (size_t)snprintf((char *)how->out, sizeof how->out, "%zx\r\n",
                             want + S3SEAL_OVERHEAD);
@@ -1252,9 +1261,13 @@ static void sealRun(s3seal_push_t *how) {
     how->out[head + want + S3SEAL_OVERHEAD] = '\r';
     how->out[head + want + S3SEAL_OVERHEAD + 1] = '\n';
 
+      how->sealWork += s3seal_clock() - at;
+    }
+
     {
       size_t total = head + want + S3SEAL_OVERHEAD + 2;
       size_t done = 0;
+      double at = s3seal_clock();
 
       while (done < total) {
 
@@ -1267,6 +1280,8 @@ static void sealRun(s3seal_push_t *how) {
 
         done += (size_t)put;
       }
+
+      how->sealWrite += s3seal_clock() - at;
     }
 
     ++how->number;

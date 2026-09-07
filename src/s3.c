@@ -194,8 +194,10 @@ static http_response_t streamObject(http_request_t *req, const char *bucket,
     double afterEnd;
     unsigned long long pieces;
     unsigned long long parks;
-    double sealing;
     double waited;
+    double sealRead;
+    double sealWork;
+    double sealWrite;
     int ended;
 
     if (s3seal_upstream.pushBegin(bucket, key, req.header("content-type"),
@@ -209,9 +211,11 @@ static http_response_t streamObject(http_request_t *req, const char *bucket,
 
     afterBody = s3seal_now_ms();
     pieces = how->pieces;
-    sealing = how->sealing;
     waited = how->waited;
     parks = how->parks;
+    sealRead = how->sealRead;
+    sealWork = how->sealWork;
+    sealWrite = how->sealWrite;
 
     ended = how->end(etag, sizeof etag);
 
@@ -220,10 +224,11 @@ static http_response_t streamObject(http_request_t *req, const char *bucket,
     if (getenv("S3SEAL_TIMING") != NULL)
       fprintf(stderr,
               "s3seal: %llu bytes - begin %.0f ms, stream %.0f ms in %llu "
-              "piece(s) [sealing %.0f, parked %.0f in %llu], finish %.0f ms, "
-              "total %.0f ms\n",
+              "piece(s) [parked %.0f in %llu; sealer: read %.0f, work %.0f, "
+              "write %.0f], finish %.0f ms, total %.0f ms\n",
               length, afterBegin - began, afterBody - afterBegin, pieces,
-              sealing, waited, parks, afterEnd - afterBody, afterEnd - began);
+              waited, parks, sealRead, sealWork, sealWrite,
+              afterEnd - afterBody, afterEnd - began);
 
     if (ended != 0 || worst < 0)
       return problem(req, 502, "InternalError",
