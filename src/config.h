@@ -50,6 +50,23 @@ typedef struct s3seal_config_t {
   /** What clients sign to us with. */
   char *credentials;
 
+  /**
+   * Whether the ETag is the plaintext's MD5, or whatever the upstream says.
+   *
+   * The MD5 is content-addressed - same bytes, same ETag, always - which is
+   * what change detection in every sync tool rests on. It also costs the
+   * whole pipeline: the ETag travels as a metadata *header*, headers go out
+   * before the body, and it is not known until the last byte has arrived. So
+   * receiving, hashing and sending cannot overlap, and the proxy runs at half
+   * the speed of the upstream it fronts.
+   *
+   * Opaque gives that up and gets it back. Nothing in the headers depends on
+   * the body any more, so a piece can be sealed and pushed the moment it
+   * lands - and AWS's own SSE-C and SSE-KMS objects have non-MD5 ETags too,
+   * so this is a shape S3 clients already meet.
+   */
+  int opaqueEtag;
+
   int port;
 
   /** The largest single PUT or part, which bounds a worker's memory. */

@@ -45,6 +45,7 @@ int main(void) {
   http.env("S3SEAL_SCRATCH");
   http.env("S3SEAL_CREDENTIALS");
   http.env("S3SEAL_MAX_PART");
+  http.env("S3SEAL_ETAG");
   http.env("S3SEAL_TIMING");
 
   /**

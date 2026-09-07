@@ -101,6 +101,21 @@ int s3seal_config_t.read(s3seal_config_t *self) {
   self->credentials = setting("S3SEAL_CREDENTIALS",
                               "/var/lib/s3seal/credentials");
 
+  {
+    char *how = setting("S3SEAL_ETAG", "md5");
+
+    self->opaqueEtag = s3seal_same(how, "opaque");
+
+    if (!self->opaqueEtag && !s3seal_same(how, "md5")) {
+      fprintf(stderr, "s3seal: S3SEAL_ETAG is 'md5' or 'opaque', not '%s'\n",
+              how);
+      free(how);
+      return -1;
+    }
+
+    free(how);
+  }
+
   self->port = (int)number("S3SEAL_PORT", 9000);
   self->maxPart = number("S3SEAL_MAX_PART", 16 * 1024 * 1024);
 
