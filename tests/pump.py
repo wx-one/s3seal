@@ -13,6 +13,12 @@ been written to the socket**, and times the wait for the response separately.
 The first number is the pipeline's throughput; the second is the far end's
 commit, reported and not counted.
 
+This only means anything against a far end that *streams*. A proxy that takes
+the whole body first and works on it afterwards will empty the socket at
+memory speed and do everything in the tail - `S3SEAL_ETAG=md5` reports 2.1
+GB/s here and then sits for three seconds. Read the tail before believing the
+rate.
+
     tests/pump.py <url> <access> <secret> <gigabytes>
 
 The body is generated as it goes, so ten gigabytes costs ten gigabytes of

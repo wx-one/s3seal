@@ -116,18 +116,31 @@ noise — which is the point, and also the risk.
 Against a MinIO in a container on loopback, so the absolute figures say more
 about this machine than about anybody's production. The ratios are the point.
 
-**Writing.** A 10 GB PUT, clocked only while bytes are moving, with the
-upstream's final commit left out (`tests/pump.py`):
+**Writing.** A 10 GB PUT with `S3SEAL_ETAG=opaque`, clocked only while bytes
+are moving, with the upstream's final commit left out (`tests/pump.py`):
 
-| 10 GB PUT       | during transfer |
-|-----------------|-----------------|
-| upstream direct | 884 MB/s |
-| through s3seal  | **605 MB/s** |
+| PUT, `opaque`  | upstream direct | through s3seal |
+|----------------|-----------------|----------------|
+| 64 MB   | 880 MB/s | 814 MB/s |
+| 256 MB  | 949 MB/s | 659 MB/s |
+| 1 GB    | 963 MB/s | 639 MB/s |
+| 10 GB   | 884 MB/s | **605 MB/s** |
 
-68% of the wire, for a body that is framed, encrypted with AES-256-GCM and
-checksummed with CRC-64/NVME on the way through. The sealing stage is the
-ceiling: it is busy the whole time but only ~42% of that is computing, so the
-next step is to seal several frames at once rather than one at a time.
+The mode matters and so does the size. A 64 MB PUT reaches 93% of the wire
+because the pipes and socket buffers in the path swallow most of it before the
+sealer becomes the ceiling; from a quarter gigabyte on, the buffers no longer
+help and it settles at about two thirds. That steady state is the honest
+figure, for a body that is framed, encrypted with AES-256-GCM and checksummed
+with CRC-64/NVME on the way through. The sealing stage is what limits it: busy
+the whole time, but only ~42% of that computing, so the next step is to seal
+several frames at once rather than one at a time.
+
+**`S3SEAL_ETAG=md5` cannot be measured this way at all.** It holds a whole
+part to hash it, so it takes the body off the socket at 2.1 GB/s and does the
+work *after* the last byte — `tests/pump.py` would report 2134 MB/s and a
+3.26 s tail on a gigabyte. End to end that mode moves 240 MB/s at 64 MB and
+285 MB/s at 1 GB, against 516 and 790 MB/s for the upstream measured the same
+way. Buying a plaintext-MD5 ETag costs roughly half the throughput.
 
 **Reading.** The same treatment for GETs — the wait for the first byte
 reported apart from the rate over the rest (`tests/drain.py`):
@@ -147,17 +160,14 @@ from. First bytes leave after 2–4 ms regardless of size.
 
 **Short objects, and what a total hides.** `tests/bench.sh` times whole
 requests from a Python client that keeps the body, the sealed copy and the
-plain copy in memory at once and hashes them. That client's own cost per byte
+plain copy in memory at once and hashes them - including a SHA-256 of the body
+inside its own clock, which is 0.063 s at 256 MB. That client's cost per byte
 grows with the object, which is why its read column falls away with size while
-the table above stays flat. Its writes are still worth reading, because that
-is where the two ETag modes differ:
+the table above stays flat. What it is still good for is the range:
 
-|                        | 64 MB | 256 MB |
-|------------------------|-------|--------|
-| write, upstream        | 438 MB/s | 569 MB/s |
-| write, s3seal `md5`    | 244 MB/s | 251 MB/s |
-| write, s3seal `opaque` | 391 MB/s | 447 MB/s |
-| **4 kB range**         | **3.0 ms** | **3.8 ms** |
+|                | 64 MB | 256 MB |
+|----------------|-------|--------|
+| **4 kB range** | **3.0 ms** | **3.8 ms** |
 
 `S3SEAL_ETAG=md5` buys a plaintext-MD5 ETag by holding a whole part to hash
 it; `opaque` streams straight through and returns an ETag that is a digest but
