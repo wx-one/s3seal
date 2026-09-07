@@ -108,48 +108,68 @@ noise — which is the point, and also the risk.
     tests/run.sh          the format, no network needed
     tests/proxy.sh        end to end, needs docker and the aws cli
     tests/bench.sh [MB]   what the sealing costs
+    tests/pump.py         a PUT, timed only while bytes move
+    tests/drain.py        a GET, timed only after the first byte
 
 ## What it costs
 
 Against a MinIO in a container on loopback, so the absolute figures say more
 about this machine than about anybody's production. The ratios are the point.
 
-The honest number is a long transfer measured while bytes are actually moving,
-with the upstream's final commit left out of the clock — 10 GB in one PUT:
+**Writing.** A 10 GB PUT, clocked only while bytes are moving, with the
+upstream's final commit left out (`tests/pump.py`):
 
 | 10 GB PUT       | during transfer |
 |-----------------|-----------------|
 | upstream direct | 884 MB/s |
 | through s3seal  | **605 MB/s** |
 
-That is 68% of the wire, for a body that is framed, encrypted with AES-256-GCM
-and checksummed with CRC-64/NVME on the way through. The sealing stage is the
+68% of the wire, for a body that is framed, encrypted with AES-256-GCM and
+checksummed with CRC-64/NVME on the way through. The sealing stage is the
 ceiling: it is busy the whole time but only ~42% of that is computing, so the
-next step is to seal several frames in parallel rather than one at a time.
+next step is to seal several frames at once rather than one at a time.
 
-Short objects are dominated by connection setup and by which ETag mode is in
-force, so they are worth reading as a pair:
+**Reading.** The same treatment for GETs — the wait for the first byte
+reported apart from the rate over the rest (`tests/drain.py`):
 
-|                       | 64 MB | 256 MB |
-|-----------------------|-------|--------|
-| write, upstream       | 438 MB/s | 569 MB/s |
+| object | upstream direct | through s3seal |
+|--------|-----------------|----------------|
+| 64 MB   | 1919 MB/s | 1193 MB/s |
+| 128 MB  | 1598 MB/s | 1096 MB/s |
+| 256 MB  | 1311 MB/s | 1115 MB/s |
+| 512 MB  | 1308 MB/s | 1073 MB/s |
+| 1 GB    | 1420 MB/s | 1179 MB/s |
+
+Opening is flat in the size of the object — ~1.1 GB/s across a sixteen-fold
+range — because the read path never holds the object: a reader task pulls from
+the upstream, opens frame by frame and writes into a pipe the response streams
+from. First bytes leave after 2–4 ms regardless of size.
+
+**Short objects, and what a total hides.** `tests/bench.sh` times whole
+requests from a Python client that keeps the body, the sealed copy and the
+plain copy in memory at once and hashes them. That client's own cost per byte
+grows with the object, which is why its read column falls away with size while
+the table above stays flat. Its writes are still worth reading, because that
+is where the two ETag modes differ:
+
+|                        | 64 MB | 256 MB |
+|------------------------|-------|--------|
+| write, upstream        | 438 MB/s | 569 MB/s |
 | write, s3seal `md5`    | 244 MB/s | 251 MB/s |
 | write, s3seal `opaque` | 391 MB/s | 447 MB/s |
-| read, upstream        | 1095 MB/s | 774 MB/s |
-| read, through s3seal  | 684 MB/s | 383 MB/s |
-| **4 kB range**        | **3.0 ms** | **3.8 ms** |
+| **4 kB range**         | **3.0 ms** | **3.8 ms** |
 
-`S3SEAL_ETAG=md5` buys a plaintext-MD5 ETag by holding the whole part to hash
+`S3SEAL_ETAG=md5` buys a plaintext-MD5 ETag by holding a whole part to hash
 it; `opaque` streams straight through and returns an ETag that is a digest but
 not an MD5 — which S3 itself permits, and which is what every server-side
 encrypted object on AWS already returns.
 
-The last row is the design in one number. A 4 kB range costs the same out of a
-256 MB object as out of a 64 MB one, because it fetches one frame and opens one
-frame. The whole-object read behind it grows with the object — so against a
-design that seals the body as a single AEAD blob and must fetch all of it to
-reach the middle, the gap is **20x at 64 MB and 92x at 256 MB**, and it keeps
-growing.
+The last row is the design in one number. A 4 kB range costs about the same
+out of a 256 MB object as out of a 64 MB one, because it fetches one frame and
+opens one frame; nearly all of those milliseconds are connection setup. The
+whole-object read behind it grows with the object — so against a design that
+seals the body as a single AEAD blob and must fetch all of it to reach the
+middle, the gap is **20x at 64 MB and 92x at 256 MB**, and it keeps growing.
 
 Framing costs **0.038%** on the wire: 25 bytes per 64 KiB frame.
 
