@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <curl/curl.h>
+
 /**
  * Where the time went, when somebody asks.
  *
@@ -156,6 +158,112 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
 
 /* ------------------------------------------------------------------- put */
 
+/**
+ * Sealing as the bytes go out, one frame at a time.
+ *
+ * The first version sealed the whole body into a second buffer and only then
+ * began the upstream request, which cost two things. A sixty-four megabyte
+ * object was held twice - once in nginx's body buffer and once here - and the
+ * upstream connection sat idle for the whole sealing pass before the first
+ * byte moved.
+ *
+ * This is `meta_fetch`'s `.feed`: curl asks for bytes, and a frame is sealed
+ * when the previous one has been handed over. What is held is one frame, so
+ * the sealing overlaps the sending and the memory is 64 KiB rather than the
+ * object.
+ */
+typedef struct {
+  const unsigned char *plain;
+  size_t length;
+  size_t at;
+
+  const unsigned char *key;
+  const unsigned char *prefix;
+  unsigned int part;
+
+  /** The one frame in flight, and how much of it curl has taken. */
+  unsigned char frame[S3SEAL_FRAME + S3SEAL_OVERHEAD];
+  size_t fill;
+  size_t sent;
+
+  unsigned long long number;
+  unsigned long long frames;
+
+  int broke;
+} s3seal_sealing_t;
+
+static size_t sealing(void *with, void *into, size_t room) {
+
+  s3seal_sealing_t *how = with;
+  unsigned char *out = into;
+  size_t done = 0;
+
+  while (done < room && !how->broke) {
+
+    /* the frame in hand is spent: seal the next one, or there is no next one */
+    if (how->sent == how->fill) {
+
+      size_t piece;
+
+      if (how->number >= how->frames)
+        break;
+
+      piece = how->length - how->at;
+
+      if (piece > S3SEAL_FRAME)
+        piece = S3SEAL_FRAME;
+
+      /**
+       * `last` marks the final frame of this run, which for a single PUT is
+       * the object's last and for a part is that part's. frame.h says why the
+       * bit means the part rather than the object.
+       */
+      if (s3seal_sealFrame(how->key, how->prefix, how->part,
+                           (unsigned int)how->number,
+                           how->number + 1 == how->frames,
+                           how->plain + how->at, piece, how->frame) != 0) {
+        how->broke = 1;
+        return CURL_READFUNC_ABORT;
+      }
+
+      how->fill = piece + S3SEAL_OVERHEAD;
+      how->sent = 0;
+      how->at += piece;
+
+      ++how->number;
+    }
+
+    {
+      size_t take = how->fill - how->sent;
+
+      if (take > room - done)
+        take = room - done;
+
+      memcpy(out + done, how->frame + how->sent, take);
+
+      how->sent += take;
+      done += take;
+    }
+  }
+
+  return done;
+}
+
+/** Set up for a run of `length` plaintext bytes under `part`. */
+static void beginSealing(s3seal_sealing_t *how, const unsigned char *key,
+                         const unsigned char *prefix, unsigned int part,
+                         const void *plain, size_t length) {
+
+  memset(how, 0, sizeof *how);
+
+  how->plain = plain;
+  how->length = length;
+  how->key = key;
+  how->prefix = prefix;
+  how->part = part;
+  how->frames = s3seal_frames(length);
+}
+
 int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
                        const char *key, const char *mime, const void *body,
                        size_t length, char *etag, size_t room) {
@@ -169,8 +277,8 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
   char nonceHex[S3SEAL_NONCE_PREFIX * 2 + 1];
   char plainText[32];
   char digest[33];
-  unsigned char *sealed;
-  unsigned long long wrote = 0;
+  s3seal_sealing_t how;
+  unsigned long long wrote;
   fetch_answer_t put;
   int worst = -1;
 
@@ -203,16 +311,12 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
 
   defer memset(dataKey, 0, S3SEAL_KEY);
 
-  sealed = malloc((size_t)s3seal_sealedSize(length) + 1);
-
-  if (sealed == NULL)
+  if (self->master->wrap(dataKey, bound, blob) != 0)
     return -1;
 
-  defer free(sealed);
+  wrote = s3seal_sealedSize(length);
 
-  if (s3seal_seal(dataKey, prefix, 0, 1, body, length, sealed, &wrote) != 0 ||
-      self->master->wrap(dataKey, bound, blob) != 0)
-    return -1;
+  beginSealing(&how, dataKey, prefix, 0, body, length);
 
   afterSeal = s3seal_clock();
 
@@ -229,7 +333,7 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
             .header("content-type", mime != NULL && mime[0] != 0
                                         ? mime
                                         : "binary/octet-stream")
-            .bytes(sealed, (size_t)wrote)
+            .feed(sealing, &how, (long long)wrote)
             .send();
 
   defer put.release();
@@ -238,12 +342,12 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
 
   if (s3seal_timing)
     fprintf(stderr,
-            "s3seal: put %llu bytes - md5 %.0f ms, seal %.0f ms, "
-            "upstream %.0f ms, total %.0f ms\n",
+            "s3seal: put %llu bytes - md5 %.0f ms, setup %.0f ms, "
+            "seal+send %.0f ms, total %.0f ms\n",
             (unsigned long long)length, afterDigest - began,
             afterSeal - afterDigest, afterPut - afterSeal, afterPut - began);
 
-  worst = put.ok ? 0 : -1;
+  worst = put.ok && !how.broke ? 0 : -1;
 
   if (!put.ok)
     fprintf(stderr, "s3seal: upstream refused PUT %s/%s: %d %.400s\n", bucket,
@@ -604,28 +708,12 @@ int s3seal_proxy_t.part(s3seal_proxy_t *self, const char *id,
   char digest[33];
   char where[S3SEAL_KEY_MAX];
   char url[S3SEAL_URL_MAX];
-  unsigned char *sealed;
-  unsigned long long wrote = 0;
+  s3seal_sealing_t how;
+  unsigned long long wrote;
   fetch_answer_t put;
 
   s3seal_md5Hex(body, length, digest);
   snprintf(etag, room, "\"%s\"", digest);
-
-  sealed = malloc((size_t)s3seal_sealedSize(length) + 1);
-
-  if (sealed == NULL)
-    return -1;
-
-  defer free(sealed);
-
-  /**
-   * `1` for last, and it means the last frame *of this part*. Whether this
-   * part is the object's last one is not known here and does not need to be -
-   * see frame.h, where the bit's meaning is written down.
-   */
-  if (s3seal_seal(what->dataKey, what->prefix, (unsigned int)number, 1, body,
-                  length, sealed, &wrote) != 0)
-    return -1;
 
   partKey(self, id, number, (unsigned long long)length, digest, where,
           sizeof where);
@@ -634,11 +722,18 @@ int s3seal_proxy_t.part(s3seal_proxy_t *self, const char *id,
                     sizeof url) != 0)
     return -1;
 
-  put = call(self, "PUT", url).bytes(sealed, (size_t)wrote).send();
+  /* sealed as it goes out, the same as a single PUT - so a part costs one
+     frame of memory rather than a part of memory */
+  wrote = s3seal_sealedSize(length);
+
+  beginSealing(&how, what->dataKey, what->prefix, (unsigned int)number, body,
+               length);
+
+  put = call(self, "PUT", url).feed(sealing, &how, (long long)wrote).send();
 
   defer put.release();
 
-  return put.ok ? 0 : -1;
+  return put.ok && !how.broke ? 0 : -1;
 }
 
 /** One parked part, as the listing named it. */
