@@ -437,6 +437,39 @@ static void tryKeys(const char *dir) {
   }
 }
 
+/**
+ * CRC-64/NVME, against the vector the specification names.
+ *
+ * "123456789" is the check value every CRC catalogue quotes, so a table built
+ * from the wrong polynomial - or reflected the wrong way, which is the easy
+ * mistake - fails here rather than at the upstream with a checksum error
+ * nobody can trace.
+ */
+static void tryCrc(void) {
+
+  char text[16];
+
+  printf("\n--- CRC-64/NVME ---\n");
+
+  check("the catalogue's check value",
+        s3seal_crc64("123456789", 9, 0) == 0xAE8B14860A799888ull);
+
+  check("nothing hashes to nothing", s3seal_crc64("", 0, 0) == 0);
+
+  /* run in two pieces, which is how the pump will do it */
+  {
+    unsigned long long whole = s3seal_crc64("123456789", 9, 0);
+    unsigned long long piece = s3seal_crc64("1234", 4, 0);
+
+    check("and it carries on where it left off",
+          s3seal_crc64("56789", 5, piece) == whole);
+  }
+
+  s3seal_crc64Text(0xAE8B14860A799888ull, text);
+
+  check("and comes out base64'd, big endian", strcmp(text, "rosUhgp5mIg=") == 0);
+}
+
 int main(int count, char **argument) {
 
   const char *dir = count > 1 ? argument[1] : ".";
@@ -446,6 +479,7 @@ int main(int count, char **argument) {
   tryRanges();
   tryMultipart();
   tryKeys(dir);
+  tryCrc();
 
   printf("\n%d run, %d failed\n", ran, failures);
 

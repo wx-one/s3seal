@@ -1,8 +1,11 @@
 # what the build makes
 build/
 
-# what a running proxy keeps - and two of these are secrets
+# what a running proxy keeps - and two of these are secrets. `var-*` too,
+# because a second instance on the same machine wants its own home and the
+# first version of this rule only knew about one.
 var/
+var-*/
 *.key
 seed
 credentials

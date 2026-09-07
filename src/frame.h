@@ -238,6 +238,27 @@ void s3seal_sha256Hex(const void *bytes, size_t length, char *into);
 void s3seal_hmacSha256(const void *key, size_t keyLength, const void *bytes,
                        size_t length, unsigned char *into);
 
+/* -------------------------------------------------------------- CRC-64/NVME
+
+ * The checksum AWS added for exactly this job.
+ *
+ * `x-amz-checksum-crc64nvme` is one of the values S3 will take **as a
+ * trailer** - after the body rather than before it - which is what lets a
+ * sender stream something it has not finished computing. That is the whole
+ * reason it is here and not, say, SHA-256: the algorithm being fast is a
+ * bonus, being allowed to arrive last is the point.
+ *
+ * The polynomial is the NVMe one, reflected, as the specification and S3 both
+ * use it. Table-driven and built once, because a bit-at-a-time loop over a
+ * gigabyte is a measurable thing and this is meant to be free.
+ */
+
+unsigned long long s3seal_crc64(const void *bytes, size_t length,
+                                unsigned long long from);
+
+/** The 8 bytes big-endian, base64'd, which is the shape S3 wants. */
+void s3seal_crc64Text(unsigned long long value, char *into);
+
 /** An S3 ETag is the MD5 of the body in hex, and that is not a security claim. */
 void s3seal_md5Hex(const void *bytes, size_t length, char *into);
 void s3seal_md5(const void *bytes, size_t length, unsigned char *into);
