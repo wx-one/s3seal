@@ -43,6 +43,15 @@ typedef struct s3seal_proxy_t {
 void s3seal_proxy_t.start(s3seal_proxy_t *self, s3seal_config_t *config,
                           s3seal_master_t *master);
 
+/**
+ * Waits for every upstream push still in flight.
+ *
+ * The scope they run in is declared in proxy.c, so this is where it can be
+ * joined - a worker that goes while one is half sent leaves an object the
+ * upstream will never finish.
+ */
+void s3seal_proxy_t.stop(s3seal_proxy_t *self);
+
 /** What we know about one stored object, out of its metadata. */
 typedef struct s3seal_seal_t {
   unsigned char key[S3SEAL_KEY];
@@ -86,6 +95,118 @@ int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
                        const char *key, const s3seal_seal_t *what,
                        unsigned long long at, unsigned long long want,
                        fetch_sink_t sink, void *with);
+
+/* --------------------------------------------------- pushing while receiving
+
+ * The shape that makes a proxy cost what the upstream costs.
+ *
+ * `put` above takes a body that is already whole, which means receiving,
+ * hashing and sending happen one after another - measured at 89, 62 and 155
+ * milliseconds on 64 MB, against 150 for the same bytes straight to the
+ * upstream. Three phases in series is why a proxy runs at half speed, and it
+ * is not the encryption: sealing costs about five of those milliseconds and
+ * already happens inside the sending.
+ *
+ * This is the same work overlapped. A piece arrives, is sealed, and goes at
+ * the upstream while the next one is still on the wire. Nothing is held but a
+ * frame.
+ *
+ * It needs the ETag to not be the plaintext's MD5 - see `opaqueEtag` in
+ * config.h - because a metadata header cannot be known before the body it
+ * describes.
+ *
+ * The upstream request runs on a thread of its own, reading from a pipe this
+ * fills. A thread rather than a task for the reason the read path has one: a
+ * green task filling a pipe that only its own carrier could drain is a
+ * deadlock by construction. The writing end is non-blocking and parks on
+ * `meta_writable`, so the carrier is given back whenever the pipe is full.
+ */
+
+typedef struct s3seal_push_t {
+  s3seal_proxy_t *proxy;
+
+  char bucket[S3SEAL_BUCKET_MAX + 1];
+  char key[S3SEAL_KEY_MAX + 1];
+  char mime[128];
+  char url[S3SEAL_URL_MAX];
+
+  unsigned char dataKey[S3SEAL_KEY];
+  unsigned char prefix[S3SEAL_NONCE_PREFIX];
+
+  /** What the client said it would send, which is what the framing needs. */
+  unsigned long long plain;
+  unsigned long long framed;
+  unsigned long long frames;
+
+  /** One frame of plaintext being gathered, and its sealed form. */
+  unsigned char gathering[S3SEAL_FRAME];
+  size_t fill;
+  unsigned char out[S3SEAL_FRAME + S3SEAL_OVERHEAD + 32];
+  size_t ready;
+  size_t sent;
+  int ended;
+
+  unsigned long long number;
+  unsigned long long crc;
+
+  /** How many times the host handed something over, for the timing line. */
+  unsigned long long pieces;
+
+  /**
+   * Where the streaming loop's time went, in milliseconds.
+   *
+   * Measured because a 64 MB run said the loop was fine and a 10 GB run said
+   * it was half the upstream's speed. Fixed costs hid it; at ten gigabytes
+   * there is nothing left to hide behind, so the three things the loop does
+   * are timed separately rather than argued about.
+   */
+  double waited;
+  double sealing;
+  unsigned long long parks;
+
+  /**
+   * Three stages, two pipes.
+   *
+   *   the request task   plaintext  ->  intoPlain
+   *   the sealing thread  fromPlain ->  intoSealed
+   *   the sending thread              fromSealed -> curl -> the upstream
+   *
+   * The middle one exists because the sealing is 7 of the 20 seconds a ten
+   * gigabyte upload takes, and while it runs on the task that receives,
+   * nothing is being read from the host. A thread of its own is allowed to
+   * block on a pipe - nobody is standing in its callback waiting - which is
+   * what the first attempt at this got wrong.
+   */
+  int intoPlain;
+  int fromPlain;
+  int intoSealed;
+  int fromSealed;
+
+  int toldRead;
+  int toldWrite;
+
+  /** The headers the thread will send, built before it starts. */
+  char out2[S3SEAL_BLOB * 2 + 1];
+  char out3[S3SEAL_NONCE_PREFIX * 2 + 1];
+  char out4[32];
+  char out5[32];
+
+  int status;
+  char etag[S3SEAL_ETAG_MAX];
+
+  int broke;
+} s3seal_push_t;
+
+/** Starts the upstream request and the thread that feeds it. */
+int s3seal_proxy_t.pushBegin(s3seal_proxy_t *self, const char *bucket,
+                             const char *key, const char *mime,
+                             unsigned long long length, s3seal_push_t **into);
+
+/** One piece of plaintext, as it arrived. Non-zero stops the read. */
+int s3seal_pushPiece(void *with, const void *bytes, size_t length);
+
+/** Finishes the body, waits for the upstream, and answers its ETag. */
+int s3seal_push_t.end(s3seal_push_t *self, char *etag, size_t room);
 
 /* ------------------------------------------------------------- multipart */
 

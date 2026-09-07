@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /**
@@ -152,12 +153,118 @@ static http_response_t abortUpload(http_request_t *req);
 static http_response_t onPut(http_request_t *req);
 static int asked(http_request_t *req, const char *name);
 
+static double s3seal_now_ms(void) {
+
+  struct timespec now;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+}
+
+/**
+ * A PUT that never holds the object.
+ *
+ * Taken when the ETag is opaque and the host can hand a body over in pieces,
+ * because those are the two things that let receiving and sending overlap:
+ * nothing in the upstream's headers depends on bytes that have not arrived,
+ * so the request can start on the first piece.
+ *
+ * `aws-chunked` framing needs the length up front, and the client's own
+ * `Content-Length` is where it comes from - a chunked client request has no
+ * length to give, so that one falls back to the buffered path.
+ */
+static http_response_t streamObject(http_request_t *req, const char *bucket,
+                                    const char *key) {
+
+  const char *said = req.header("content-length");
+  unsigned long long length = said != NULL ? strtoull(said, NULL, 10) : 0;
+  char etag[S3SEAL_ETAG_MAX];
+  s3seal_push_t *how;
+  int worst;
+
+  if (said == NULL || said[0] == 0)
+    return problem(req, 411, "MissingContentLength",
+                   "a streamed upload has to say how long it is");
+
+  {
+    double began = s3seal_now_ms();
+    double afterBegin;
+    double afterBody;
+    double afterEnd;
+    unsigned long long pieces;
+    unsigned long long parks;
+    double sealing;
+    double waited;
+    int ended;
+
+    if (s3seal_upstream.pushBegin(bucket, key, req.header("content-type"),
+                                  length, &how) != 0)
+      return problem(req, 502, "InternalError",
+                     "the upload could not be begun");
+
+    afterBegin = s3seal_now_ms();
+
+    worst = req.streamBody(s3seal_pushPiece, how);
+
+    afterBody = s3seal_now_ms();
+    pieces = how->pieces;
+    sealing = how->sealing;
+    waited = how->waited;
+    parks = how->parks;
+
+    ended = how->end(etag, sizeof etag);
+
+    afterEnd = s3seal_now_ms();
+
+    if (getenv("S3SEAL_TIMING") != NULL)
+      fprintf(stderr,
+              "s3seal: %llu bytes - begin %.0f ms, stream %.0f ms in %llu "
+              "piece(s) [sealing %.0f, parked %.0f in %llu], finish %.0f ms, "
+              "total %.0f ms\n",
+              length, afterBegin - began, afterBody - afterBegin, pieces,
+              sealing, waited, parks, afterEnd - afterBody, afterEnd - began);
+
+    if (ended != 0 || worst < 0)
+      return problem(req, 502, "InternalError",
+                     "the upstream would not take it");
+  }
+
+  return req.reply(200).header("ETag", held(req, etag)).send();
+}
+
 static http_response_t putObject(http_request_t *req) {
 
   char key[S3SEAL_KEY_MAX + 1];
   char etag[S3SEAL_ETAG_MAX];
   const char *bucket = req.param("bucket");
-  http_body_t body = req.readBody();
+  double began;
+  http_body_t body;
+  double afterBody;
+
+  /**
+   * The overlapping path first, because the buffered one begins by waiting
+   * for the whole body and there is no going back from that.
+   */
+  if (s3seal_settings.opaqueEtag && req.canStream()) {
+
+    char early[S3SEAL_KEY_MAX + 1];
+    const char *encoding = req.header("content-encoding");
+
+    keyOf(req, early, sizeof early);
+
+    if (s3seal_settings.ours(early))
+      return problem(req, 403, "AccessDenied", "that prefix is the proxy's");
+
+    /* aws-chunked from the client has to be unwrapped first, and unwrapping
+       is something the buffered path does */
+    if (encoding == NULL || strstr(encoding, "aws-chunked") == NULL)
+      return streamObject(req, bucket, early);
+  }
+
+  began = s3seal_now_ms();
+  body = req.readBody();
+  afterBody = s3seal_now_ms();
 
   keyOf(req, key, sizeof key);
 
@@ -192,8 +299,8 @@ static http_response_t putObject(http_request_t *req) {
   }
 
   if (getenv("S3SEAL_TIMING") != NULL)
-    fprintf(stderr, "s3seal: nginx handed over %llu bytes\n",
-            (unsigned long long)body.length);
+    fprintf(stderr, "s3seal: nginx took %.0f ms to hand over %llu bytes\n",
+            afterBody - began, (unsigned long long)body.length);
 
   if (s3seal_upstream.put(bucket, key, req.header("content-type"), body.bytes,
                           body.length, etag, sizeof etag) != 0)
@@ -702,6 +809,9 @@ void s3seal_stop(void) {
     return;
 
   s3seal_serving = 0;
+
+  /* the upstream pushes finish before the client that started them goes */
+  s3seal_upstream.stop();
 
   meta_fetchDone();
   s3seal_settings.drop();

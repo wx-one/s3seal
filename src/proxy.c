@@ -8,6 +8,20 @@
 
 #include <curl/curl.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/**
+ * Linux has this and glibc only declares it behind `_GNU_SOURCE`, which has
+ * to be defined before the first header - and what the first header is, in a
+ * lowered translation unit, is not this file's to decide. The number is
+ * stable and the call degrades to a failed fcntl anywhere it is not.
+ */
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 1031
+#endif
+
 /**
  * Where the time went, when somebody asks.
  *
@@ -45,6 +59,18 @@ static fetch_call_t call(s3seal_proxy_t *self, const char *method,
 
   return meta_fetch(method, url)
       .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+      .before(s3seal_sign, &self->signer);
+}
+
+/** The same, for a body that is framed and ends with its own checksum. */
+static fetch_call_t trailered(s3seal_proxy_t *self, const char *method,
+                              const char *url) {
+
+  return meta_fetch(method, url)
+      .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+      /* what the SDKs send beside the trailer, and what an upstream keys off
+         to know a checksum is coming rather than to ignore the line */
+      .header("x-amz-sdk-checksum-algorithm", "CRC64NVME")
       .before(s3seal_sign, &self->signer);
 }
 
@@ -130,8 +156,12 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
   into->how.plain = strtoull(got.header("x-amz-meta-plain"), NULL, 10);
   into->how.partSize = strtoull(got.header("x-amz-meta-part"), NULL, 10);
 
+  /* ours when there is one; the upstream's own when the ETag is opaque and
+     nobody wrote one down */
   snprintf(into->etag, sizeof into->etag, "%.63s",
-           got.header("x-amz-meta-etag"));
+           got.header("x-amz-meta-etag")[0] != 0
+               ? got.header("x-amz-meta-etag")
+               : got.header("etag"));
 
   /**
    * What was written down against what the length says it must be. They can
@@ -181,16 +211,57 @@ typedef struct {
   const unsigned char *prefix;
   unsigned int part;
 
-  /** The one frame in flight, and how much of it curl has taken. */
-  unsigned char frame[S3SEAL_FRAME + S3SEAL_OVERHEAD];
+  /**
+   * The one frame in flight, wrapped as an `aws-chunked` chunk, and how much
+   * of it curl has taken. The extra room is the chunk's own header and the
+   * two line ends around it.
+   */
+  unsigned char frame[S3SEAL_FRAME + S3SEAL_OVERHEAD + 32];
   size_t fill;
   size_t sent;
 
   unsigned long long number;
   unsigned long long frames;
 
+  /** Over the *sealed* bytes, which is what the upstream will check. */
+  unsigned long long crc;
+
+  /** Set once the terminator and the trailer have been staged. */
+  int ended;
+
   int broke;
 } s3seal_sealing_t;
+
+/**
+ * What the framed body weighs, which `Content-Length` has to say.
+ *
+ * Every chunk is `<hex length>\r\n<bytes>\r\n`, so the overhead is the hex
+ * digits plus four. The trailer at the end is a fixed size because a CRC-64
+ * is always twelve base64 characters.
+ */
+static unsigned long long framedSize(unsigned long long plain) {
+
+  unsigned long long frames = s3seal_frames(plain);
+  unsigned long long total = 0;
+
+  for (unsigned long long at = 0; at < frames; ++at) {
+
+    unsigned long long piece = plain - at * S3SEAL_FRAME;
+    char header[24];
+
+    if (piece > S3SEAL_FRAME)
+      piece = S3SEAL_FRAME;
+
+    piece += S3SEAL_OVERHEAD;
+
+    total += (unsigned long long)snprintf(header, sizeof header, "%llx\r\n",
+                                          piece);
+    total += piece + 2;
+  }
+
+  /* `0\r\n`, the trailer line, and the empty line that ends it */
+  return total + 3 + 25 + 12 + 2 + 2;
+}
 
 static size_t sealing(void *with, void *into, size_t room) {
 
@@ -200,18 +271,47 @@ static size_t sealing(void *with, void *into, size_t room) {
 
   while (done < room && !how->broke) {
 
-    /* the frame in hand is spent: seal the next one, or there is no next one */
+    /* the chunk in hand is spent: make the next one, or the terminator */
     if (how->sent == how->fill) {
 
       size_t piece;
+      size_t head;
 
-      if (how->number >= how->frames)
-        break;
+      if (how->number >= how->frames) {
+
+        char text[16];
+
+        if (how->ended)
+          break;
+
+        /**
+         * The end of an `aws-chunked` body: a zero chunk, then the checksum
+         * over everything that went before it.
+         *
+         * This is the whole reason the checksum is a CRC and travels here
+         * rather than in a header. A header goes out before the body, and
+         * nothing that is computed *from* the body can be known by then - so
+         * a sender that streams has to be allowed to say it last, and S3
+         * allows exactly this list of checksums to be said last.
+         */
+        s3seal_crc64Text(how->crc, text);
+
+        how->fill = (size_t)snprintf((char *)how->frame, sizeof how->frame,
+                                     "0\r\nx-amz-checksum-crc64nvme:%s\r\n\r\n",
+                                     text);
+        how->sent = 0;
+        how->ended = 1;
+
+        continue;
+      }
 
       piece = how->length - how->at;
 
       if (piece > S3SEAL_FRAME)
         piece = S3SEAL_FRAME;
+
+      head = (size_t)snprintf((char *)how->frame, sizeof how->frame, "%zx\r\n",
+                              piece + S3SEAL_OVERHEAD);
 
       /**
        * `last` marks the final frame of this run, which for a single PUT is
@@ -221,12 +321,20 @@ static size_t sealing(void *with, void *into, size_t room) {
       if (s3seal_sealFrame(how->key, how->prefix, how->part,
                            (unsigned int)how->number,
                            how->number + 1 == how->frames,
-                           how->plain + how->at, piece, how->frame) != 0) {
+                           how->plain + how->at, piece,
+                           how->frame + head) != 0) {
         how->broke = 1;
         return CURL_READFUNC_ABORT;
       }
 
-      how->fill = piece + S3SEAL_OVERHEAD;
+      /* over the sealed bytes only, never over the framing around them */
+      how->crc = s3seal_crc64(how->frame + head, piece + S3SEAL_OVERHEAD,
+                              how->crc);
+
+      how->frame[head + piece + S3SEAL_OVERHEAD] = '\r';
+      how->frame[head + piece + S3SEAL_OVERHEAD + 1] = '\n';
+
+      how->fill = head + piece + S3SEAL_OVERHEAD + 2;
       how->sent = 0;
       how->at += piece;
 
@@ -278,6 +386,7 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
   char plainText[32];
   char digest[33];
   s3seal_sealing_t how;
+  char sealedText[32];
   unsigned long long wrote;
   fetch_answer_t put;
   int worst = -1;
@@ -314,7 +423,10 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
   if (self->master->wrap(dataKey, bound, blob) != 0)
     return -1;
 
-  wrote = s3seal_sealedSize(length);
+  wrote = framedSize(length);
+
+  snprintf(sealedText, sizeof sealedText, "%llu",
+           (unsigned long long)s3seal_sealedSize(length));
 
   beginSealing(&how, dataKey, prefix, 0, body, length);
 
@@ -324,7 +436,7 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
   s3seal_toHex(prefix, S3SEAL_NONCE_PREFIX, nonceHex);
   snprintf(plainText, sizeof plainText, "%llu", (unsigned long long)length);
 
-  put = call(self, "PUT", url)
+  put = trailered(self, "PUT", url)
             .header("x-amz-meta-seal", sealHex)
             .header("x-amz-meta-nonce", nonceHex)
             .header("x-amz-meta-plain", plainText)
@@ -333,6 +445,9 @@ int s3seal_proxy_t.put(s3seal_proxy_t *self, const char *bucket,
             .header("content-type", mime != NULL && mime[0] != 0
                                         ? mime
                                         : "binary/octet-stream")
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", sealedText)
+            .header("x-amz-trailer", "x-amz-checksum-crc64nvme")
             .feed(sealing, &how, (long long)wrote)
             .send();
 
@@ -623,7 +738,7 @@ int s3seal_proxy_t.begin(s3seal_proxy_t *self, const char *bucket,
       0)
     return -1;
 
-  put = call(self, "PUT", url)
+  put = trailered(self, "PUT", url)
             .header("x-amz-meta-seal", sealHex)
             .header("x-amz-meta-nonce", nonceHex)
             .header("x-amz-meta-key", key)
@@ -709,6 +824,7 @@ int s3seal_proxy_t.part(s3seal_proxy_t *self, const char *id,
   char where[S3SEAL_KEY_MAX];
   char url[S3SEAL_URL_MAX];
   s3seal_sealing_t how;
+  char sealedText[32];
   unsigned long long wrote;
   fetch_answer_t put;
 
@@ -724,12 +840,20 @@ int s3seal_proxy_t.part(s3seal_proxy_t *self, const char *id,
 
   /* sealed as it goes out, the same as a single PUT - so a part costs one
      frame of memory rather than a part of memory */
-  wrote = s3seal_sealedSize(length);
+  wrote = framedSize(length);
+
+  snprintf(sealedText, sizeof sealedText, "%llu",
+           (unsigned long long)s3seal_sealedSize(length));
 
   beginSealing(&how, what->dataKey, what->prefix, (unsigned int)number, body,
                length);
 
-  put = call(self, "PUT", url).feed(sealing, &how, (long long)wrote).send();
+  put = trailered(self, "PUT", url)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", sealedText)
+            .header("x-amz-trailer", "x-amz-checksum-crc64nvme")
+            .feed(sealing, &how, (long long)wrote)
+            .send();
 
   defer put.release();
 
@@ -1064,4 +1188,350 @@ void s3seal_proxy_t.abort(s3seal_proxy_t *self, const char *bucket,
 
     gone.release();
   }
+}
+
+/* ========================================================================= */
+/*                       pushing while still receiving                       */
+/* ========================================================================= */
+
+/**
+ * The upstream request runs here, on a thread, reading the pipe the request
+ * task fills. See proxy.h for why it is a thread.
+ */
+task pushers;
+
+/**
+ * The middle stage: plaintext in, sealed frames out.
+ *
+ * Blocking reads throughout, and that is the point - this thread waiting for
+ * a whole frame costs nothing, because the sending thread reads a pipe that
+ * already has bytes in it and never waits for an amount.
+ */
+static void sealRun(s3seal_push_t *how) {
+
+  for (;;) {
+
+    size_t want = (size_t)(how->plain - how->number * S3SEAL_FRAME);
+    size_t got = 0;
+    size_t head;
+
+    if (how->number >= how->frames)
+      break;
+
+    if (want > S3SEAL_FRAME)
+      want = S3SEAL_FRAME;
+
+    while (got < want) {
+
+      ssize_t piece = read(how->fromPlain, how->gathering + got, want - got);
+
+      if (piece <= 0) {
+        how->broke = 1;
+        break;
+      }
+
+      got += (size_t)piece;
+    }
+
+    if (how->broke)
+      break;
+
+    head = (size_t)snprintf((char *)how->out, sizeof how->out, "%zx\r\n",
+                            want + S3SEAL_OVERHEAD);
+
+    if (s3seal_sealFrame(how->dataKey, how->prefix, 0,
+                         (unsigned int)how->number,
+                         how->number + 1 == how->frames, how->gathering, want,
+                         how->out + head) != 0) {
+      how->broke = 1;
+      break;
+    }
+
+    how->crc = s3seal_crc64(how->out + head, want + S3SEAL_OVERHEAD, how->crc);
+
+    how->out[head + want + S3SEAL_OVERHEAD] = '\r';
+    how->out[head + want + S3SEAL_OVERHEAD + 1] = '\n';
+
+    {
+      size_t total = head + want + S3SEAL_OVERHEAD + 2;
+      size_t done = 0;
+
+      while (done < total) {
+
+        ssize_t put = write(how->intoSealed, how->out + done, total - done);
+
+        if (put <= 0) {
+          how->broke = 1;
+          break;
+        }
+
+        done += (size_t)put;
+      }
+    }
+
+    ++how->number;
+  }
+
+  /* the checksum the upstream was told to expect at the end */
+  if (!how->broke) {
+
+    char text[16];
+    char tail[80];
+    int length;
+    int done = 0;
+
+    s3seal_crc64Text(how->crc, text);
+
+    length = snprintf(tail, sizeof tail,
+                      "0\r\nx-amz-checksum-crc64nvme:%s\r\n\r\n", text);
+
+    while (done < length) {
+
+      ssize_t put = write(how->intoSealed, tail + done, (size_t)(length - done));
+
+      if (put <= 0)
+        break;
+
+      done += (int)put;
+    }
+  }
+
+  close(how->fromPlain);
+  close(how->intoSealed);
+
+  how->fromPlain = -1;
+  how->intoSealed = -1;
+}
+
+static void pushRun(s3seal_push_t *how) {
+
+  fetch_answer_t put = trailered(how->proxy, "PUT", how->url)
+                           .header("x-amz-meta-seal", how->out2)
+                           .header("x-amz-meta-nonce", how->out3)
+                           .header("x-amz-meta-plain", how->out4)
+                           .header("x-amz-meta-part", "0")
+                           .header("content-type", how->mime)
+                           .header("content-encoding", "aws-chunked")
+                           .header("x-amz-decoded-content-length", how->out5)
+                           .header("x-amz-trailer", "x-amz-checksum-crc64nvme")
+                           .from(how->fromSealed, (long long)how->framed)
+                           .send();
+
+  how->status = put.failed ? 502 : put.status;
+
+  snprintf(how->etag, sizeof how->etag, "%.63s", put.header("etag"));
+
+  put.release();
+
+  close(how->fromSealed);
+
+  how->fromSealed = -1;
+
+  /* the word that it is over, which the request task is parked on */
+  {
+    unsigned char one = 1;
+
+    if (write(how->toldWrite, &one, 1) != 1)
+      how->broke = 1;
+
+    close(how->toldWrite);
+
+    how->toldWrite = -1;
+  }
+}
+
+void s3seal_proxy_t.stop(s3seal_proxy_t *self) {
+
+  (void)self;
+
+  join pushers;
+}
+
+/** Everything, however full the pipe is; parks rather than spins. */
+static int pushAll(s3seal_push_t *how, const unsigned char *at,
+                   size_t length) {
+
+  size_t done = 0;
+
+  while (done < length) {
+
+    ssize_t put = write(how->intoPlain, at + done, length - done);
+
+    if (put > 0) {
+      done += (size_t)put;
+      continue;
+    }
+
+    if (put < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+
+      /* the pipe is full: give the carrier back until the thread has read */
+      double at = s3seal_clock();
+
+      meta_writable(how->intoPlain);
+
+      how->waited += s3seal_clock() - at;
+      ++how->parks;
+
+      continue;
+    }
+
+    return -1;
+  }
+
+  return 0;
+}
+
+/**
+ * A piece of plaintext into the first pipe, and nothing else.
+ *
+ * Whatever this task does between two pieces is time the host is not being
+ * read from, so it does one copy. The sealing is the next stage's business.
+ */
+int s3seal_pushPiece(void *with, const void *bytes, size_t length) {
+
+  s3seal_push_t *how = with;
+
+  if (how->broke)
+    return -1;
+
+  ++how->pieces;
+
+  if (pushAll(how, bytes, length) != 0) {
+    how->broke = 1;
+    return -1;
+  }
+
+  return 0;
+}
+
+int s3seal_proxy_t.pushBegin(s3seal_proxy_t *self, const char *bucket,
+                             const char *key, const char *mime,
+                             unsigned long long length, s3seal_push_t **into) {
+
+  s3seal_push_t *how = calloc(1, sizeof *how);
+  unsigned char blob[S3SEAL_BLOB];
+  char *bound = s3seal_join(bucket, "/", key);
+  int body[2];
+  int sealed[2];
+  int told[2];
+
+  *into = NULL;
+
+  if (how == NULL || bound == NULL) {
+    free(how);
+    free(bound);
+    return -1;
+  }
+
+  defer free(bound);
+
+  how->proxy = self;
+  how->plain = length;
+  how->frames = s3seal_frames(length);
+  how->framed = framedSize(length);
+  how->intoPlain = -1;
+  how->fromPlain = -1;
+  how->intoSealed = -1;
+  how->fromSealed = -1;
+  how->toldRead = -1;
+  how->toldWrite = -1;
+
+  snprintf(how->bucket, sizeof how->bucket, "%s", bucket);
+  snprintf(how->key, sizeof how->key, "%s", key);
+  snprintf(how->mime, sizeof how->mime, "%.127s",
+           mime != NULL && mime[0] != 0 ? mime : "binary/octet-stream");
+
+  if (s3seal_urlFor(self->config->upstream, bucket, key, how->url,
+                    sizeof how->url) != 0 ||
+      s3seal_random(how->dataKey, S3SEAL_KEY) != 0 ||
+      s3seal_random(how->prefix, S3SEAL_NONCE_PREFIX) != 0 ||
+      self->master->wrap(how->dataKey, bound, blob) != 0) {
+    free(how);
+    return -1;
+  }
+
+  s3seal_toHex(blob, sizeof blob, how->out2);
+  s3seal_toHex(how->prefix, S3SEAL_NONCE_PREFIX, how->out3);
+  snprintf(how->out4, sizeof how->out4, "%llu", length);
+  snprintf(how->out5, sizeof how->out5, "%llu",
+           (unsigned long long)s3seal_sealedSize(length));
+
+  if (pipe(body) != 0 || pipe(sealed) != 0 || pipe(told) != 0) {
+    free(how);
+    return -1;
+  }
+
+  how->fromPlain = body[0];
+  how->intoPlain = body[1];
+  how->fromSealed = sealed[0];
+  how->intoSealed = sealed[1];
+  how->toldRead = told[0];
+  how->toldWrite = told[1];
+
+  /* the writing end only, because the reading end belongs to a thread that
+     wants an ordinary blocking read */
+  fcntl(how->intoPlain, F_SETFL, O_NONBLOCK);
+
+  /**
+   * A bigger pipe, and it is worth a syscall.
+   *
+   * The default is 64 kB and the host hands bodies over in pieces of about
+   * 160, so every piece filled the pipe and parked twice on the way through.
+   * Receiving and sending then took turns instead of overlapping: measured at
+   * 207 ms where the two legs alone are 89 and 155.
+   *
+   * A megabyte is a few pieces of slack, which is all that is needed for the
+   * thread to stay ahead. It is a request rather than a demand - a kernel
+   * that says no leaves the default, which still works.
+   */
+  fcntl(how->intoPlain, F_SETPIPE_SZ, 1024 * 1024);
+  fcntl(how->intoSealed, F_SETPIPE_SZ, 1024 * 1024);
+
+  /* the sealer first, so the sender never finds an empty pipe on its way in */
+  go pushers @thread sealRun(how);
+  go pushers @thread pushRun(how);
+
+  *into = how;
+
+  return 0;
+}
+
+int s3seal_push_t.end(s3seal_push_t *self, char *etag, size_t room) {
+
+  int worst = -1;
+
+  /* the end of the plaintext; the sealing stage does the rest and writes the
+     checksum itself */
+  meta_letGo(self->intoPlain);
+  close(self->intoPlain);
+
+  self->intoPlain = -1;
+
+  /* park until the thread says the upstream has answered */
+  {
+    unsigned char one;
+    ssize_t got = read(self->toldRead, &one, 1);
+
+    if (got < 0) {
+      meta_readable(self->toldRead);
+      got = read(self->toldRead, &one, 1);
+    }
+
+    meta_letGo(self->toldRead);
+    close(self->toldRead);
+
+    self->toldRead = -1;
+
+    if (got != 1)
+      self->broke = 1;
+  }
+
+  if (!self->broke && self->status >= 200 && self->status < 300) {
+    snprintf(etag, room, "%s", self->etag);
+    worst = 0;
+  }
+
+  free(self);
+
+  return worst;
 }
