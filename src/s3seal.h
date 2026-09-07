@@ -114,6 +114,29 @@ enum s3sealLimit {
   S3SEAL_UPLOADID_MAX = 64,
   S3SEAL_URL_MAX = 2048,
 
+  /**
+   * How many frames the sealing stage takes in one bite.
+   *
+   * Four, and the number was found by measuring rather than reasoning.
+   *
+   * One at a time meant the stage handed over 163,840 times on a ten
+   * gigabyte upload and spent twelve seconds doing nothing else. Sixteen -
+   * which is 1 MiB, and so **exactly the buffer between the stages** - was
+   * barely better: a batch the size of the buffer leaves it always either
+   * full or empty, so both sides take turns standing still.
+   *
+   * Four is a quarter of the buffer, so four bites fit in it and the stage
+   * can work on one while the next is still being drained. That is the whole
+   * trick: what matters is the *ratio* to the buffer, not the size of either.
+   * Growing the buffer to eight megabytes while keeping one frame per bite
+   * changed nothing at all, which is how the ratio was found.
+   *
+   *   1 frame   516 MB/s     write-wait 5.9 s
+   *   16        537          4.7
+   *   4         629          2.7
+   */
+  S3SEAL_BATCH = 4,
+
   /** S3's own ceiling on parts in one upload. */
   S3SEAL_PARTS_MAX = 10000
 };

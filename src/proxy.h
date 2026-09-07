@@ -138,10 +138,15 @@ typedef struct s3seal_push_t {
   unsigned long long framed;
   unsigned long long frames;
 
-  /** One frame of plaintext being gathered, and its sealed form. */
-  unsigned char gathering[S3SEAL_FRAME];
+  /**
+   * A batch of frames being gathered, and its sealed form.
+   *
+   * `S3SEAL_BATCH` at a time rather than one, because the handing over
+   * between stages costs more than the sealing does - see s3seal.h.
+   */
+  unsigned char gathering[S3SEAL_FRAME * S3SEAL_BATCH];
   size_t fill;
-  unsigned char out[S3SEAL_FRAME + S3SEAL_OVERHEAD + 32];
+  unsigned char out[(S3SEAL_FRAME + S3SEAL_OVERHEAD + 32) * S3SEAL_BATCH];
   size_t ready;
   size_t sent;
   int ended;
