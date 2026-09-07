@@ -193,11 +193,16 @@ else
   say "ok       and they are not the client's bytes"
 fi
 
+# In python, because a shell command substitution drops NUL bytes: on random
+# data the needle would sometimes shrink to two or three bytes and then match
+# by chance. A security check that passes for the wrong reason, or fails for
+# one, is worse than none.
 check "the client's first bytes appear nowhere in it" \
-    "$(head -c 48 "$work/a.bin" > "$work/needle";
-       grep -c -aF -f /dev/null "$work/a.raw" 2>/dev/null;
-       if grep -qaF "$(head -c 24 "$work/a.bin")" "$work/a.raw" 2>/dev/null
-       then echo found; else echo absent; fi)" "absent"
+    "$(python3 -c 'import sys
+plain = open(sys.argv[1], "rb").read(64)
+raw = open(sys.argv[2], "rb").read()
+print("found" if plain in raw else "absent")' "$work/a.bin" "$work/a.raw")" \
+    "absent"
 
 # it can see the *wrapped* key and that is all it can do with it: the wrapping
 # key is derived from a seed the upstream has never been told
