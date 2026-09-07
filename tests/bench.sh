@@ -55,6 +55,7 @@ S3SEAL_HOME="$home" S3SEAL_PORT="$port" \
     S3SEAL_UPSTREAM="http://127.0.0.1:$upstreamPort" \
     S3SEAL_UPSTREAM_ACCESS=benchuser S3SEAL_UPSTREAM_SECRET=benchpass123 \
     S3SEAL_MAX_PART=$((megabytes * 1024 * 1024 + 1048576)) \
+    S3SEAL_ETAG="${S3SEAL_ETAG:-md5}" \
     "$here/run.sh" >"$work/server.log" 2>&1 &
 
 waited=0
@@ -75,7 +76,7 @@ PROXY_SECRET=$(awk '{print $2}' "$home/credentials")
 export PROXY_KEY PROXY_SECRET
 export UPSTREAM_KEY=benchuser UPSTREAM_SECRET=benchpass123
 
-printf 'upstream: MinIO in a container on loopback\n'
+printf 'upstream: MinIO in a container on loopback, ETag=%s\n' "${S3SEAL_ETAG:-md5}"
 
 "$here/tests/bench.py" "http://127.0.0.1:$port" \
     "http://127.0.0.1:$upstreamPort" "$megabytes"

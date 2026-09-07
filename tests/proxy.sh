@@ -157,10 +157,21 @@ check "an object goes up" "$?" "0"
 s3 s3 cp s3://sealed/a.bin "$work/a.back" >/dev/null
 same "and comes back byte for byte" "$work/a.bin" "$work/a.back"
 
-check "and its ETag is the plaintext MD5" \
-    "$(s3 s3api head-object --bucket sealed --key a.bin \
-         --query ETag --output text | tr -d '\"')" \
-    "$(md5sum "$work/a.bin" | cut -d' ' -f1)"
+# only in the mode that promises it. Opaque ETags exist so that nothing in
+# the upstream's headers depends on bytes that have not arrived yet, which is
+# what lets receiving and sending overlap - see config.h.
+if [ "${S3SEAL_ETAG:-md5}" = "md5" ]; then
+  check "and its ETag is the plaintext MD5" \
+      "$(s3 s3api head-object --bucket sealed --key a.bin \
+           --query ETag --output text | tr -d '\"')" \
+      "$(md5sum "$work/a.bin" | cut -d' ' -f1)"
+else
+  check "and its ETag is the upstream's, not the plaintext MD5" \
+      "$(s3 s3api head-object --bucket sealed --key a.bin \
+           --query ETag --output text | tr -d '\"' |
+         grep -qx "$(md5sum "$work/a.bin" | cut -d' ' -f1)" && echo same ||
+         echo other)" "other"
+fi
 
 check "and its length is the plaintext length" \
     "$(s3 s3api head-object --bucket sealed --key a.bin \
