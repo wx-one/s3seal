@@ -110,76 +110,82 @@ noise — which is the point, and also the risk.
     tests/bench.sh [MB]   what the sealing costs
     tests/pump.py         a PUT, timed only while bytes move
     tests/drain.py        a GET, timed only after the first byte
+    tests/mixed.py        many clients at once, reading and writing
 
 ## What it costs
 
 Against a MinIO in a container on loopback, so the absolute figures say more
 about this machine than about anybody's production. The ratios are the point.
 
-**Writing.** A 10 GB PUT with `S3SEAL_ETAG=opaque`, clocked only while bytes
-are moving, with the upstream's final commit left out (`tests/pump.py`):
+### One stream at a time
 
-| PUT, `opaque`  | upstream direct | through s3seal |
-|----------------|-----------------|----------------|
-| 64 MB   | 880 MB/s | 814 MB/s |
-| 256 MB  | 949 MB/s | 659 MB/s |
-| 1 GB    | 963 MB/s | 639 MB/s |
-| 10 GB   | 884 MB/s | **605 MB/s** |
+A 1 GB PUT with `S3SEAL_ETAG=opaque`, clocked only while bytes are moving and
+with the upstream's commit left out (`tests/pump.py`), and reads clocked only
+after the first byte (`tests/drain.py`):
 
-The mode matters and so does the size. A 64 MB PUT reaches 93% of the wire
-because the pipes and socket buffers in the path swallow most of it before the
-sealer becomes the ceiling; from a quarter gigabyte on, the buffers no longer
-help and it settles at about two thirds. That steady state is the honest
-figure, for a body that is framed, encrypted with AES-256-GCM and checksummed
-with CRC-64/NVME on the way through. The sealing stage is what limits it: busy
-the whole time, but only ~42% of that computing, so the next step is to seal
-several frames at once rather than one at a time.
+|         | upstream direct | through s3seal |
+|---------|-----------------|----------------|
+| PUT 1 GB  | 956 MB/s | **665 MB/s** |
+| GET 64 MB  | 1936 MB/s | 1207 MB/s |
+| GET 256 MB | 2463 MB/s | 1218 MB/s |
+| GET 1 GB   | 2446 MB/s | 1175 MB/s |
 
-**`S3SEAL_ETAG=md5` cannot be measured this way at all.** It holds a whole
-part to hash it, so it takes the body off the socket at 2.1 GB/s and does the
-work *after* the last byte — `tests/pump.py` would report 2134 MB/s and a
-3.26 s tail on a gigabyte. End to end that mode moves 240 MB/s at 64 MB and
-285 MB/s at 1 GB, against 516 and 790 MB/s for the upstream measured the same
-way. Buying a plaintext-MD5 ETag costs roughly half the throughput.
-
-**Reading.** The same treatment for GETs — the wait for the first byte
-reported apart from the rate over the rest (`tests/drain.py`):
-
-| object | upstream direct | through s3seal |
-|--------|-----------------|----------------|
-| 64 MB   | 1919 MB/s | 1193 MB/s |
-| 128 MB  | 1598 MB/s | 1096 MB/s |
-| 256 MB  | 1311 MB/s | 1115 MB/s |
-| 512 MB  | 1308 MB/s | 1073 MB/s |
-| 1 GB    | 1420 MB/s | 1179 MB/s |
-
-Opening is flat in the size of the object — ~1.1 GB/s across a sixteen-fold
-range — because the read path never holds the object: a reader task pulls from
-the upstream, opens frame by frame and writes into a pipe the response streams
-from. First bytes leave after 2–4 ms regardless of size.
-
-**Short objects, and what a total hides.** `tests/bench.sh` times whole
-requests from a Python client that keeps the body, the sealed copy and the
-plain copy in memory at once and hashes them - including a SHA-256 of the body
-inside its own clock, which is 0.063 s at 256 MB. That client's cost per byte
-grows with the object, which is why its read column falls away with size while
-the table above stays flat. What it is still good for is the range:
-
-|                | 64 MB | 256 MB |
-|----------------|-------|--------|
-| **4 kB range** | **3.0 ms** | **3.8 ms** |
+Opening is flat in the size of the object - about 1.2 GB/s across a sixteen-
+fold range - because the read path never holds the object: a reader task pulls
+from the upstream, opens frame by frame and writes into a pipe the response
+streams from. First bytes leave after 2-3 ms whatever the size.
 
 `S3SEAL_ETAG=md5` buys a plaintext-MD5 ETag by holding a whole part to hash
-it; `opaque` streams straight through and returns an ETag that is a digest but
-not an MD5 — which S3 itself permits, and which is what every server-side
-encrypted object on AWS already returns.
+it, and costs roughly half the write throughput. `opaque` streams straight
+through and returns an ETag that is a digest but not an MD5 - which S3 itself
+permits, and which is what every server-side encrypted object on AWS already
+returns.
 
-The last row is the design in one number. A 4 kB range costs about the same
-out of a 256 MB object as out of a 64 MB one, because it fetches one frame and
-opens one frame; nearly all of those milliseconds are connection setup. The
-whole-object read behind it grows with the object — so against a design that
-seals the body as a single AEAD blob and must fetch all of it to reach the
-middle, the gap is **20x at 64 MB and 92x at 256 MB**, and it keeps growing.
+### Many clients at once
+
+One stream is the friendliest thing you can measure, and it hid the problems
+this proxy actually had. `tests/mixed.py` runs sixty objects of 64 kB, 1 MB
+and 16 MB with 60% GET, 15% range, 20% PUT and 5% LIST, over keep-alive
+connections. Readers read the seeded set; writers write keys of their own,
+because clients that overwrite the very objects other clients are reading are
+a real thing but a rare one. Every 2xx body is checked against the length it
+announced, so a read that stops halfway counts as the failure it is:
+
+| clients | direct ops/s | s3seal ops/s | direct MB/s | s3seal MB/s |
+|---------|--------------|--------------|-------------|-------------|
+| 1  | 138 | 85  | 657  | 418  |
+| 8  | 526 | 299 | 2475 | 1404 |
+| 32 | 688 | 459 | 3302 | 2183 |
+
+Nothing is dropped at one or eight clients. At 32 there are still failures -
+fourteen in fifteen seconds, almost all of them on the write path - and that
+is the next thing to fix.
+
+Read-only, the proxy keeps up with the upstream almost exactly: 595 against
+612 ops/s at eight clients, with nothing dropped. The gap above is what
+writing costs.
+
+Three things this benchmark found, none of them visible to a single stream:
+
+- **`EINTR` was treated as a fatal error** in every pipe loop. A signal to a
+  worker cut a download short of the Content-Length already sent, and the
+  client waited out its own timeout. Fixing it doubled the mixed figure.
+- **A read asked twice** - HEAD for the metadata, GET for the bytes - and an
+  object rewritten in between answered the second question with bytes the
+  first question's key would not open. A whole read now asks once and takes
+  the metadata off its own answer; a range still needs the geometry first, so
+  it asks twice, closes the gap with `If-Match`, and retries once on a 412.
+  Doubled it again.
+- **A single stream flatters everything.** The write figure above is 70% of
+  the wire; under a mixed load the whole proxy runs at 57% to 67% of it.
+
+### The frames
+
+The design in one number: a 4 kB range costs **3.0 ms** out of a 64 MB object
+and **3.8 ms** out of a 256 MB one, because it fetches one frame and opens one
+frame; nearly all of those milliseconds are connection setup. Against a design
+that seals the body as a single AEAD blob and must fetch all of it to reach
+the middle, that is **20x at 64 MB and 92x at 256 MB**, and it keeps growing.
 
 Framing costs **0.038%** on the wire: 25 bytes per 64 KiB frame.
 

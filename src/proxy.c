@@ -76,50 +76,52 @@ static fetch_call_t trailered(s3seal_proxy_t *self, const char *method,
 
 /* ------------------------------------------------------------------ head */
 
-int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
-                          const char *key, s3seal_seal_t *into, int *status) {
+/**
+ * The sealing metadata out of a block of response headers.
+ *
+ * One parser, because a HEAD and a GET answer with the same headers and the
+ * two have to agree about what they mean. It takes the block rather than an
+ * answer so that it also serves `.heard`, where the body is still on its way
+ * and there is no answer yet.
+ *
+ * Every lookup is copied on the spot. `meta_fetchHeaderIn` hands back one
+ * buffer per thread and the next call overwrites it, so a header read now and
+ * used after another read would quietly be the other one.
+ */
+static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
+                           const char *key, const char *head, size_t length,
+                           s3seal_seal_t *into) {
 
-  char url[S3SEAL_URL_MAX];
   char *bound = s3seal_join(bucket, "/", key);
   unsigned char blob[S3SEAL_BLOB];
-  fetch_answer_t got;
-  const char *seal;
-  int worst = -1;
+  char seal[S3SEAL_BLOB * 2 + 2];
+  char nonce[S3SEAL_NONCE_PREFIX * 2 + 2];
+  char mine[S3SEAL_ETAG_MAX];
+  unsigned long long plain;
+  unsigned long long part;
 
   memset(into, 0, sizeof *into);
 
-  if (bound == NULL ||
-      s3seal_urlFor(self->config->upstream, bucket, key, url, sizeof url) != 0) {
+  if (bound == NULL) {
     free(bound);
     return -1;
   }
 
   defer free(bound);
 
-  got = call(self, "HEAD", url).nobody().send();
-
-  defer got.release();
-
-  *status = got.failed ? 502 : got.status;
-
-  if (!got.ok) {
-
-    if (got.status != 404)
-      fprintf(stderr, "s3seal: upstream HEAD %s/%s: %d %s\n", bucket, key,
-              got.status, got.failed ? got.why : "");
-
-    return -1;
-  }
-
-  into->stored = strtoull(got.header("content-length"), NULL, 10);
+  into->stored =
+      strtoull(meta_fetchHeaderIn(head, length, "content-length"), NULL, 10);
 
   /* bounded: a header comes out of a kilobyte of room and these fields are
      smaller, so the truncation is deliberate rather than discovered */
-  snprintf(into->mime, sizeof into->mime, "%.127s", got.header("content-type"));
+  snprintf(into->mime, sizeof into->mime, "%.127s",
+           meta_fetchHeaderIn(head, length, "content-type"));
   snprintf(into->when, sizeof into->when, "%.63s",
-           got.header("last-modified"));
-
-  seal = got.header("x-amz-meta-seal");
+           meta_fetchHeaderIn(head, length, "last-modified"));
+  snprintf(into->upstreamEtag, sizeof into->upstreamEtag, "%.63s",
+           meta_fetchHeaderIn(head, length, "etag"));
+  snprintf(seal, sizeof seal, "%s",
+           meta_fetchHeaderIn(head, length, "x-amz-meta-seal"));
 
   /**
    * No sealing metadata: an object that was in the bucket before we were.
@@ -131,9 +133,19 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
   if (seal[0] == 0) {
     into->plain = 1;
     into->how.plain = into->stored;
-    snprintf(into->etag, sizeof into->etag, "%.63s", got.header("etag"));
+    snprintf(into->etag, sizeof into->etag, "%.63s", into->upstreamEtag);
     return 0;
   }
+
+  snprintf(nonce, sizeof nonce, "%s",
+           meta_fetchHeaderIn(head, length, "x-amz-meta-nonce"));
+  snprintf(mine, sizeof mine, "%.63s",
+           meta_fetchHeaderIn(head, length, "x-amz-meta-etag"));
+
+  plain = strtoull(meta_fetchHeaderIn(head, length, "x-amz-meta-plain"), NULL,
+                   10);
+  part = strtoull(meta_fetchHeaderIn(head, length, "x-amz-meta-part"), NULL,
+                  10);
 
   /* it answers how many bytes it decoded, and negative for anything else */
   if (s3seal_fromHex(seal, blob, sizeof blob) != (int)sizeof blob) {
@@ -141,8 +153,8 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
     return -1;
   }
 
-  if (s3seal_fromHex(got.header("x-amz-meta-nonce"), into->prefix,
-                     S3SEAL_NONCE_PREFIX) != S3SEAL_NONCE_PREFIX) {
+  if (s3seal_fromHex(nonce, into->prefix, S3SEAL_NONCE_PREFIX) !=
+      S3SEAL_NONCE_PREFIX) {
     fprintf(stderr, "s3seal: %s/%s has a nonce that is not hex\n", bucket, key);
     return -1;
   }
@@ -153,15 +165,13 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
     return -1;
   }
 
-  into->how.plain = strtoull(got.header("x-amz-meta-plain"), NULL, 10);
-  into->how.partSize = strtoull(got.header("x-amz-meta-part"), NULL, 10);
+  into->how.plain = plain;
+  into->how.partSize = part;
 
   /* ours when there is one; the upstream's own when the ETag is opaque and
      nobody wrote one down */
   snprintf(into->etag, sizeof into->etag, "%.63s",
-           got.header("x-amz-meta-etag")[0] != 0
-               ? got.header("x-amz-meta-etag")
-               : got.header("etag"));
+           mine[0] != 0 ? mine : into->upstreamEtag);
 
   /**
    * What was written down against what the length says it must be. They can
@@ -181,7 +191,37 @@ int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
     }
   }
 
-  worst = 0;
+  return 0;
+}
+
+int s3seal_proxy_t.headOf(s3seal_proxy_t *self, const char *bucket,
+                          const char *key, s3seal_seal_t *into, int *status) {
+
+  char url[S3SEAL_URL_MAX];
+  fetch_answer_t got;
+  int worst;
+
+  memset(into, 0, sizeof *into);
+
+  if (s3seal_urlFor(self->config->upstream, bucket, key, url, sizeof url) != 0)
+    return -1;
+
+  got = call(self, "HEAD", url).nobody().send();
+
+  defer got.release();
+
+  *status = got.failed ? 502 : got.status;
+
+  if (!got.ok) {
+
+    if (got.status != 404)
+      fprintf(stderr, "s3seal: upstream HEAD %s/%s: %d %s\n", bucket, key,
+              got.status, got.failed ? got.why : "");
+
+    return -1;
+  }
+
+  worst = sealFromHeaders(self, bucket, key, got.head, got.headLength, into);
 
   return worst;
 }
@@ -594,10 +634,11 @@ static int finishOpening(s3seal_opening_t *how) {
   return 0;
 }
 
-int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
-                       const char *key, const s3seal_seal_t *what,
-                       unsigned long long at, unsigned long long want,
-                       fetch_sink_t sink, void *with) {
+/** One attempt at a range, against one particular version of the object. */
+static int getOnce(s3seal_proxy_t *self, const char *bucket, const char *key,
+                   const s3seal_seal_t *what, unsigned long long at,
+                   unsigned long long want, fetch_sink_t sink, void *with,
+                   int *status) {
 
   char url[S3SEAL_URL_MAX];
   char range[64];
@@ -608,6 +649,8 @@ int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
   s3seal_opening_t how;
   fetch_answer_t got;
   int worst;
+
+  *status = 0;
 
   if (s3seal_urlFor(self->config->upstream, bucket, key, url, sizeof url) != 0)
     return -1;
@@ -629,18 +672,186 @@ int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
   snprintf(range, sizeof range, "bytes=%llu-%llu", from,
            from + length - (length > 0 ? 1 : 0));
 
+  {
+    /**
+     * `If-Match` against what the HEAD saw, because this read asks twice.
+     *
+     * A range needs the frame geometry before it can name the bytes it wants,
+     * so the HEAD cannot be skipped the way a whole read skips it. What can
+     * be closed is the gap: if the object was rewritten in between, the
+     * upstream answers 412 instead of handing over bytes that this key will
+     * not open - which is what used to show up as a frame that would not open
+     * and then a body stopping short of the length already promised.
+     *
+     * The upstream's own ETag, not ours: `etag` is the plaintext MD5 we wrote
+     * down, which says nothing about the stored bytes.
+     */
+    fetch_call_t ask = call(self, "GET", url).header("range", range);
+
+    if (what->upstreamEtag[0] != 0)
+      ask = ask.header("if-match", what->upstreamEtag);
+
+    got = ask.drain(opening, &how).send();
+  }
+
+  defer got.release();
+
+  *status = got.failed ? 502 : got.status;
+
+  worst = got.ok && finishOpening(&how) == 0 && !how.broke ? 0 : -1;
+
+  return worst;
+}
+
+int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
+                       const char *key, const s3seal_seal_t *what,
+                       unsigned long long at, unsigned long long want,
+                       fetch_sink_t sink, void *with) {
+
+  int status = 0;
+  int worst = getOnce(self, bucket, key, what, at, want, sink, with, &status);
+
+  /**
+   * A 412 means the object was rewritten between the HEAD and this GET.
+   *
+   * Nothing was handed to the sink - the upstream refused before any body -
+   * so reading the metadata again and asking again is safe and is what the
+   * client asked for. Once: a second 412 means the object is being rewritten
+   * faster than it can be read, and answering an error beats looping.
+   */
+  if (worst != 0 && status == 412) {
+
+    s3seal_seal_t fresh;
+    int again = 0;
+
+    if (self->headOf(bucket, key, &fresh, &again) == 0)
+      worst = getOnce(self, bucket, key, &fresh, at, want, sink, with,
+                      &status);
+  }
+
+  if (worst != 0)
+    fprintf(stderr, "s3seal: could not open %s/%s: upstream %d\n", bucket, key,
+            status);
+
+  return worst;
+}
+
+/** The two halves of a whole-object read, for the hook that starts it. */
+typedef struct {
+  s3seal_learn_t *learn;
+  s3seal_opening_t *how;
+} s3seal_whole_t;
+
+/**
+ * The headers of a whole-object GET, before its body is let through.
+ *
+ * Everything the response says about the object is here, and this is the only
+ * moment at which it can be learned without asking a second time. Answering
+ * non-zero stops the transfer, which is what a body we cannot open deserves.
+ */
+static int learnedHead(void *raw, const char *head, size_t length,
+                       long status) {
+
+  s3seal_whole_t *whole = raw;
+  s3seal_learn_t *learn = whole->learn;
+  unsigned char one = 1;
+
+  learn->status = (int)status;
+
+  learn->worst = status >= 200 && status < 300
+                     ? sealFromHeaders(learn->proxy, learn->bucket, learn->key,
+                                       head, length, &learn->what)
+                     : -1;
+
+  /* now the opening knows how much plaintext there is to hand over */
+  if (learn->worst == 0)
+    whole->how->left = learn->what.how.plain;
+
+  /* the caller's own copy, before anything of ours can go away under it */
+  if (learn->into != NULL)
+    *learn->into = learn->what;
+  if (learn->worstInto != NULL)
+    *learn->worstInto = learn->worst;
+  if (learn->statusInto != NULL)
+    *learn->statusInto = learn->status;
+
+  /* and only then the wake-up, so what it wakes to is already written */
+  if (!learn->told) {
+    learn->told = 1;
+    if (write(learn->tell, &one, 1) != 1)
+      learn->worst = -1;
+  }
+
+  return learn->worst;
+}
+
+/**
+ * Body into the sink: through the frames, or straight through.
+ *
+ * An object that was in the bucket before this proxy was has no frames, and
+ * `plain` is how the metadata says so. One drain serves both because which it
+ * is only becomes known once the headers have been read, which is after the
+ * drain was named.
+ */
+static size_t openingOrPass(void *raw, const void *bytes, size_t length) {
+
+  s3seal_opening_t *how = raw;
+
+  if (how->what->plain)
+    return how->sink(how->with, bytes, length) == length ? length : 0;
+
+  return opening(raw, bytes, length);
+}
+
+int s3seal_proxy_t.getWhole(s3seal_proxy_t *self, s3seal_learn_t *learn,
+                            fetch_sink_t sink, void *with) {
+
+  char url[S3SEAL_URL_MAX];
+  s3seal_opening_t how;
+  s3seal_whole_t whole;
+  fetch_answer_t got;
+  int worst;
+
+  learn->proxy = self;
+  learn->worst = -1;
+  learn->status = 0;
+
+  if (s3seal_urlFor(self->config->upstream, learn->bucket, learn->key, url,
+                    sizeof url) != 0)
+    return -1;
+
+  memset(&how, 0, sizeof how);
+
+  /**
+   * The opening state points into what the hook is about to fill.
+   *
+   * `.heard` runs before the first byte reaches the drain, so by the time
+   * these matter they are set - and if the hook failed it stopped the
+   * transfer, so the drain is never called at all.
+   */
+  how.what = &learn->what;
+  how.sink = sink;
+  how.with = with;
+
+  whole.learn = learn;
+  whole.how = &how;
+
   got = call(self, "GET", url)
-            .header("range", range)
-            .drain(opening, &how)
+            .heard(learnedHead, &whole)
+            .drain(openingOrPass, &how)
             .send();
 
   defer got.release();
 
-  worst = got.ok && finishOpening(&how) == 0 && !how.broke ? 0 : -1;
+  worst = got.ok && learn->worst == 0 &&
+                  (learn->what.plain || finishOpening(&how) == 0) && !how.broke
+              ? 0
+              : -1;
 
-  if (worst != 0)
-    fprintf(stderr, "s3seal: could not open %s/%s: upstream %d\n", bucket, key,
-            got.failed ? 502 : got.status);
+  if (worst != 0 && learn->status != 404)
+    fprintf(stderr, "s3seal: could not read %s/%s: upstream %d %s\n",
+            learn->bucket, learn->key, learn->status,
+            got.failed ? got.why : (how.broke ? "a frame would not open" : ""));
 
   return worst;
 }
@@ -1228,6 +1439,9 @@ static void sealRun(s3seal_push_t *how) {
 
         ssize_t piece = read(how->fromPlain, how->gathering + got, want - got);
 
+        if (piece < 0 && errno == EINTR)
+          continue;
+
         if (piece <= 0) {
           how->broke = 1;
           break;
@@ -1273,6 +1487,9 @@ static void sealRun(s3seal_push_t *how) {
 
         ssize_t put = write(how->intoSealed, how->out + done, total - done);
 
+        if (put < 0 && errno == EINTR)
+          continue;
+
         if (put <= 0) {
           how->broke = 1;
           break;
@@ -1303,6 +1520,9 @@ static void sealRun(s3seal_push_t *how) {
     while (done < length) {
 
       ssize_t put = write(how->intoSealed, tail + done, (size_t)(length - done));
+
+      if (put < 0 && errno == EINTR)
+        continue;
 
       if (put <= 0)
         break;

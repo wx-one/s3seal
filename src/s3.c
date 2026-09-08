@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -325,9 +326,24 @@ typedef struct {
   unsigned long long want;
 
   int into;
+
+  /** Set for a whole read, which asks once and learns as it goes. */
+  int whole;
+  s3seal_learn_t learn;
+  int tell;
 } s3seal_pull_t;
 
-/** Opened bytes into the pipe, whatever it takes. */
+/**
+ * Opened bytes into the pipe nginx is streaming from.
+ *
+ * `EINTR` is not a failure and must not be reported as one. A short return
+ * from this is how curl is told the application could not take the data, and
+ * it answers by aborting the transfer with CURLE_WRITE_ERROR - so a signal
+ * arriving while a worker sat in `write` used to end the download, leave the
+ * body short of the Content-Length already sent, and hang the client until it
+ * gave up. Measured at eight concurrent clients: 23 aborted reads in twenty
+ * seconds, every one of them "Failed writing received data to disk".
+ */
 static size_t intoPipe(void *with, const void *bytes, size_t length) {
 
   const char *at = bytes;
@@ -336,6 +352,9 @@ static size_t intoPipe(void *with, const void *bytes, size_t length) {
   while (done < length) {
 
     ssize_t put = write(*(int *)with, at + done, length - done);
+
+    if (put < 0 && errno == EINTR)
+      continue;
 
     if (put <= 0)
       return done;
@@ -348,8 +367,34 @@ static size_t intoPipe(void *with, const void *bytes, size_t length) {
 
 static void pullRun(s3seal_pull_t *job) {
 
-  s3seal_upstream.get(job->bucket, job->key, &job->what, job->at, job->want,
-                      intoPipe, &job->into);
+  if (job->whole) {
+
+    job->learn.bucket = job->bucket;
+    job->learn.key = job->key;
+    job->learn.tell = job->tell;
+
+    s3seal_upstream.getWhole(&job->learn, intoPipe, &job->into);
+
+    /**
+     * The request task is parked on `tell` and has to be let go even when no
+     * headers ever came - a 404 or a refused connection reaches no hook, and
+     * a task parked on a pipe nobody will write to never answers.
+     */
+    if (!job->learn.told) {
+
+      unsigned char one = 1;
+
+      job->learn.told = 1;
+      (void)!write(job->tell, &one, 1);
+    }
+
+    close(job->tell);
+
+  } else {
+
+    s3seal_upstream.get(job->bucket, job->key, &job->what, job->at, job->want,
+                        intoPipe, &job->into);
+  }
 
   /* the close is what tells nginx the answer is finished, whether it went
      well or not - a client sees a short body, which is what a failed read of
@@ -357,6 +402,109 @@ static void pullRun(s3seal_pull_t *job) {
   close(job->into);
 
   free(job);
+}
+
+/**
+ * A whole object, in one request to the upstream.
+ *
+ * The order is the awkward part. A client has to be told Content-Length
+ * before the body starts, and the length is on the upstream's answer - so the
+ * fetch goes first, on a thread, and this task parks until that thread has
+ * read the headers. Then the reply goes out and the same fetch's body streams
+ * on through the pipe it has been filling meanwhile.
+ *
+ * What the thread learns lands in `what`, `worst` and `status` here, on this
+ * task's own frame. The hook writes them before it pokes `tell` and never
+ * touches them again, and this task does not return until it has been poked -
+ * so the frame is alive for every write and every read of it. Nothing is
+ * allocated for this, and nothing has to be freed.
+ */
+static http_response_t wholeObject(http_request_t *req, const char *bucket,
+                                   const char *key, int bodyToo) {
+
+  s3seal_pull_t *job = calloc(1, sizeof *job);
+  s3seal_seal_t what;
+  int worst = -1;
+  int status = 0;
+  int body[2];
+  int tell[2];
+  unsigned char one;
+  ssize_t heard;
+
+  if (job == NULL)
+    return problem(req, 500, "InternalError", "out of memory");
+
+  if (pipe(body) != 0) {
+    free(job);
+    return problem(req, 500, "InternalError", "no pipe");
+  }
+
+  if (pipe(tell) != 0) {
+    close(body[0]);
+    close(body[1]);
+    free(job);
+    return problem(req, 500, "InternalError", "no pipe");
+  }
+
+  memset(&what, 0, sizeof what);
+
+  snprintf(job->bucket, sizeof job->bucket, "%s", bucket);
+  snprintf(job->key, sizeof job->key, "%s", key);
+
+  job->whole = 1;
+  job->into = body[1];
+  job->tell = tell[1];
+  job->learn.into = &what;
+  job->learn.worstInto = &worst;
+  job->learn.statusInto = &status;
+
+  go readers @thread pullRun(job);
+
+  /* until the thread has the headers - one byte, and it always comes */
+  heard = read(tell[0], &one, 1);
+
+  if (heard < 0) {
+    meta_readable(tell[0]);
+    heard = read(tell[0], &one, 1);
+  }
+
+  meta_letGo(tell[0]);
+  close(tell[0]);
+
+  if (heard != 1 || worst != 0) {
+
+    /* the thread owns `job` and the writing end and closes both itself */
+    close(body[0]);
+
+    return status == 404 ? problem(req, 404, "NoSuchKey", "no such key")
+                         : problem(req, 502, "InternalError",
+                                   "the upstream would not say");
+  }
+
+  {
+    char *length = req->scratch + req->scratchUsed;
+    http_response_t answer = req.reply(200);
+
+    req->scratchUsed +=
+        1 + snprintf(length, (size_t)(META_HTTP_SCRATCH - req->scratchUsed),
+                     "%llu", what.how.plain);
+
+    answer = answer.header("ETag", held(req, what.etag))
+                 .header("Content-Length", length)
+                 .header("Accept-Ranges", "bytes")
+                 .mime(held(req, what.mime[0] != 0 ? what.mime
+                                                   : "binary/octet-stream"));
+
+    if (what.when[0] != 0)
+      answer = answer.header("Last-Modified", held(req, what.when));
+
+    if (!bodyToo || what.how.plain == 0) {
+      close(body[0]);
+      return answer.send();
+    }
+
+    return answer.stream(body[0]);
+  }
 }
 
 static http_response_t getObject(http_request_t *req, int bodyToo) {
@@ -374,6 +522,21 @@ static http_response_t getObject(http_request_t *req, int bodyToo) {
 
   if (s3seal_settings.ours(key))
     return problem(req, 404, "NoSuchKey", "no such key");
+
+  /**
+   * A whole read asks once; a ranged one has to ask twice.
+   *
+   * The metadata is on the answer's own headers, so a body read needs no HEAD
+   * in front of it - a round trip saved, and the end of a race: between a
+   * HEAD and a GET the object can be rewritten, and then the key from the
+   * first answer will not open the bytes of the second.
+   *
+   * A range cannot do that. Which sealed bytes to ask for is worked out from
+   * the frame geometry, so the geometry has to be known before the request is
+   * made. That one still asks twice and closes the gap with `If-Match`.
+   */
+  if (wants == NULL || strncmp(wants, "bytes=", 6) != 0)
+    return wholeObject(req, bucket, key, bodyToo);
 
   if (s3seal_upstream.headOf(bucket, key, &what, &status) != 0)
     return status == 404

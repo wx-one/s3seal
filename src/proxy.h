@@ -63,6 +63,15 @@ typedef struct s3seal_seal_t {
   char mime[128];
   char when[64];
 
+  /**
+   * The upstream's own ETag, kept apart from the one we answer with.
+   *
+   * `etag` is what a client is told, which for a sealed object is the
+   * plaintext MD5 we wrote down. This one identifies the stored bytes, which
+   * is what a conditional second request has to be about.
+   */
+  char upstreamEtag[S3SEAL_ETAG_MAX];
+
   /** What the upstream holds, which is the plaintext plus the framing. */
   unsigned long long stored;
 
@@ -95,6 +104,53 @@ int s3seal_proxy_t.get(s3seal_proxy_t *self, const char *bucket,
                        const char *key, const s3seal_seal_t *what,
                        unsigned long long at, unsigned long long want,
                        fetch_sink_t sink, void *with);
+
+/**
+ * What a whole-object read learns from its own answer, and how it says so.
+ *
+ * A read used to ask twice - HEAD for the metadata, GET for the bytes - and
+ * an object rewritten between the two answered the second question with bytes
+ * that the first question's key will not open. Measured under eight clients
+ * that both read and wrote the same keys: a frame that would not open, and a
+ * body that then stopped short of the Content-Length already sent, so the
+ * client waited for the rest until it gave up.
+ *
+ * So a whole read asks once and takes the metadata off the same answer. Its
+ * length is not known until those headers arrive, though, and the client has
+ * to be told it before the body starts - so `tell` is poked once the metadata
+ * is in, and the request task is parked on the other end of it.
+ *
+ * `into` is where the request task wants its own copy. It has to be a place
+ * that task owns: the thread running the fetch owns everything else here and
+ * lets go of it as soon as the transfer ends, which for a small object is
+ * before the task has woken up.
+ */
+typedef struct s3seal_learn_t {
+  s3seal_proxy_t *proxy;
+  const char *bucket;
+  const char *key;
+
+  s3seal_seal_t what;
+  int worst;
+  int status;
+
+  s3seal_seal_t *into;
+  int *worstInto;
+  int *statusInto;
+
+  int tell;
+  int told;
+} s3seal_learn_t;
+
+/**
+ * Fetches a whole object in one request and opens it into `sink`.
+ *
+ * The metadata is filled in from the answer's own headers before a byte of
+ * body reaches the sink, copied to where the caller asked for it, and then
+ * `tell` is poked.
+ */
+int s3seal_proxy_t.getWhole(s3seal_proxy_t *self, s3seal_learn_t *learn,
+                            fetch_sink_t sink, void *with);
 
 /* --------------------------------------------------- pushing while receiving
 
