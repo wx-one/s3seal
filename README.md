@@ -143,13 +143,11 @@ returns.
 
 ### Many clients at once
 
-One stream is the friendliest thing you can measure, and it hid the problems
-this proxy actually had. `tests/mixed.py` runs sixty objects of 64 kB, 1 MB
-and 16 MB with 60% GET, 15% range, 20% PUT and 5% LIST, over keep-alive
-connections. Readers read the seeded set; writers write keys of their own,
-because clients that overwrite the very objects other clients are reading are
-a real thing but a rare one. Every 2xx body is checked against the length it
-announced, so a read that stops halfway counts as the failure it is:
+`tests/mixed.py` runs sixty objects of 64 kB, 1 MB and 16 MB with 60% GET,
+15% range, 20% PUT and 5% LIST, over keep-alive connections. Readers read the
+seeded set and writers write keys of their own. Every 2xx body is checked
+against the length it announced, so a read that stops halfway counts as the
+failure it is:
 
 | clients | direct ops/s | s3seal ops/s | direct MB/s | s3seal MB/s |
 |---------|--------------|--------------|-------------|-------------|
@@ -163,21 +161,9 @@ is the next thing to fix.
 
 Read-only, the proxy keeps up with the upstream almost exactly: 595 against
 612 ops/s at eight clients, with nothing dropped. The gap above is what
-writing costs.
-
-Three things this benchmark found, none of them visible to a single stream:
-
-- **`EINTR` was treated as a fatal error** in every pipe loop. A signal to a
-  worker cut a download short of the Content-Length already sent, and the
-  client waited out its own timeout. Fixing it doubled the mixed figure.
-- **A read asked twice** - HEAD for the metadata, GET for the bytes - and an
-  object rewritten in between answered the second question with bytes the
-  first question's key would not open. A whole read now asks once and takes
-  the metadata off its own answer; a range still needs the geometry first, so
-  it asks twice, closes the gap with `If-Match`, and retries once on a 412.
-  Doubled it again.
-- **A single stream flatters everything.** The write figure above is 70% of
-  the wire; under a mixed load the whole proxy runs at 57% to 67% of it.
+writing costs. One stream is the friendliest thing you can measure - the write
+figure above is 70% of the wire, where a mixed load puts the whole proxy at
+57% to 67% of it - so this table is the one to judge it by.
 
 ### The frames
 
