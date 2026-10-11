@@ -44,7 +44,8 @@ void s3seal_proxy_t.start(s3seal_proxy_t *self, s3seal_config_t *config,
                           s3seal_master_t *master);
 
 /**
- * Waits for every upstream push still in flight.
+ * Waits for every upstream push still in flight, then closes the upstream
+ * connections that were kept for reuse.
  *
  * The scope they run in is declared in proxy.c, so this is where it can be
  * joined - a worker that goes while one is half sent leaves an object the

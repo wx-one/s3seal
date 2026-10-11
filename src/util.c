@@ -172,22 +172,6 @@ int s3seal_fromHex(const char *from, unsigned char *into, size_t room) {
   return (int)(length / 2);
 }
 
-unsigned int s3seal_crc32(const void *bytes, size_t length, unsigned int from) {
-
-  const unsigned char *at = bytes;
-  unsigned int state = ~from;
-
-  for (size_t step = 0; step < length; ++step) {
-
-    state ^= at[step];
-
-    for (int bit = 0; bit < 8; ++bit)
-      state = (state >> 1) ^ (0xEDB88320u & (unsigned int)(-(int)(state & 1)));
-  }
-
-  return ~state;
-}
-
 long long s3seal_now(void) {
 
   struct timespec when;
@@ -195,18 +179,6 @@ long long s3seal_now(void) {
   clock_gettime(CLOCK_REALTIME, &when);
 
   return (long long)when.tv_sec;
-}
-
-void s3seal_iso8601(long long when, char *into, size_t room) {
-
-  time_t seconds = (time_t)when;
-  struct tm broken;
-
-  gmtime_r(&seconds, &broken);
-
-  snprintf(into, room, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-           broken.tm_year + 1900, broken.tm_mon + 1, broken.tm_mday,
-           broken.tm_hour, broken.tm_min, broken.tm_sec);
 }
 
 void s3seal_amzTime(long long when, char *into, size_t room) {
@@ -230,26 +202,6 @@ void s3seal_amzDay(long long when, char *into, size_t room) {
 
   snprintf(into, room, "%04d%02d%02d", broken.tm_year + 1900, broken.tm_mon + 1,
            broken.tm_mday);
-}
-
-void s3seal_httpDate(long long when, char *into, size_t room) {
-
-  static const char *const days[] = {"Sun", "Mon", "Tue", "Wed",
-                                     "Thu", "Fri", "Sat"};
-  static const char *const months[] = {"Jan", "Feb", "Mar", "Apr",
-                                       "May", "Jun", "Jul", "Aug",
-                                       "Sep", "Oct", "Nov", "Dec"};
-
-  time_t seconds = (time_t)when;
-  struct tm broken;
-
-  gmtime_r(&seconds, &broken);
-
-  /* the names by hand, because strftime would use the process's locale */
-  snprintf(into, room, "%s, %02d %s %04d %02d:%02d:%02d GMT",
-           days[broken.tm_wday % 7], broken.tm_mday,
-           months[broken.tm_mon % 12], broken.tm_year + 1900, broken.tm_hour,
-           broken.tm_min, broken.tm_sec);
 }
 
 long long s3seal_readAmzTime(const char *text) {
@@ -328,27 +280,15 @@ int s3seal_buf_t.add(s3seal_buf_t *self, const char *text) {
   return self->addn(text, strlen(text));
 }
 
-int s3seal_buf_t.addf(s3seal_buf_t *self, const char *shape, ...) {
+int s3seal_buf_t.addText(s3seal_buf_t *self, text_t text) {
 
-  va_list args;
-  va_list again;
-  int wanted;
+  size_t length = text.length();
 
-  va_start(args, shape);
-  va_copy(again, args);
-
-  wanted = vsnprintf(NULL, 0, shape, args);
-  va_end(args);
-
-  if (wanted < 0 || !self->grow((size_t)wanted)) {
-    va_end(again);
+  if (!self->grow(length))
     return 0;
-  }
 
-  vsnprintf(self->at + self->count, (size_t)wanted + 1, shape, again);
-  va_end(again);
-
-  self->count += (size_t)wanted;
+  text.into(self->at + self->count, length + 1);
+  self->count += length;
 
   return 1;
 }

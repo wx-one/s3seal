@@ -290,6 +290,32 @@ check "and the parked parts were cleaned up" \
 check "and a listing does not show the proxy's own prefix" \
     "$(s3 s3 ls --recursive s3://sealed/ | grep -c '.s3seal')" "0"
 
+# The two checks above pass with nothing parked at all, so an upload is left
+# open here: its key sits under the scratch prefix until it is aborted.
+open_id=$(s3 s3api create-multipart-upload --bucket sealed --key open.bin \
+            --query UploadId --output text)
+
+check "an open upload parks something on the upstream" \
+    "$(raw s3 ls --recursive s3://sealed/ | grep -c '.s3seal')" "1"
+
+check "which a listing through the proxy leaves out" \
+    "$(s3 s3 ls --recursive s3://sealed/ | grep -c '.s3seal')" "0"
+
+# one page, not the CLI's merge of several, which has no count of its own
+raw_count=$(raw s3api list-objects-v2 --bucket sealed --no-paginate \
+              --query KeyCount --output text)
+
+check "and leaves out of the key count" \
+    "$(s3 s3api list-objects-v2 --bucket sealed --no-paginate \
+         --query KeyCount --output text)" "$((${raw_count:-0} - 1))"
+
+check "and an encoded listing leaves it out too" \
+    "$(s3 s3api list-objects-v2 --bucket sealed --encoding-type url \
+         --query 'Contents[].Key' --output text | grep -c 's3seal')" "0"
+
+s3 s3api abort-multipart-upload --bucket sealed --key open.bin \
+    --upload-id "$open_id" >/dev/null
+
 # ---------------------------------------------------------------- deleting
 
 s3 s3 rm s3://sealed/a.bin >/dev/null

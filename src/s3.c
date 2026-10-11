@@ -87,20 +87,22 @@ static http_response_t problem(http_request_t *req, int status,
  * on the upstream gives its carrier to another request, and two of them would
  * then share one buffer.
  */
-static const char *held(http_request_t *req, const char *text) {
+static const char *heldText(http_request_t *req, text_t text) {
 
   char *into = req->scratch + req->scratchUsed;
   size_t room = (size_t)(META_HTTP_SCRATCH - req->scratchUsed);
-  size_t length = strlen(text);
+  size_t length = text.into(into, room);
 
   if (length + 1 > room)
     return "";
 
-  memcpy(into, text, length + 1);
-
   req->scratchUsed += (int)length + 1;
 
   return into;
+}
+
+static const char *held(http_request_t *req, const char *text) {
+  return heldText(req, TEXT`${text}`);
 }
 
 /** The key a `*key` pattern caught, percent-decoded. */
@@ -312,7 +314,7 @@ static http_response_t putObject(http_request_t *req) {
                           body.length, etag, sizeof etag) != 0)
     return problem(req, 502, "InternalError", "the upstream would not take it");
 
-  return req.reply(200).header("ETag", etag).send();
+  return req.reply(200).header("ETag", held(req, etag)).send();
 }
 
 /** What a reader thread was told to fetch. Its own, and it frees it. */
@@ -482,15 +484,11 @@ static http_response_t wholeObject(http_request_t *req, const char *bucket,
   }
 
   {
-    char *length = req->scratch + req->scratchUsed;
     http_response_t answer = req.reply(200);
 
-    req->scratchUsed +=
-        1 + snprintf(length, (size_t)(META_HTTP_SCRATCH - req->scratchUsed),
-                     "%llu", what.how.plain);
-
     answer = answer.header("ETag", held(req, what.etag))
-                 .header("Content-Length", length)
+                 .header("Content-Length",
+                         heldText(req, TEXT`${what.how.plain}`))
                  .header("Accept-Ranges", "bytes")
                  .mime(held(req, what.mime[0] != 0 ? what.mime
                                                    : "binary/octet-stream"));
@@ -570,19 +568,11 @@ static http_response_t getObject(http_request_t *req, int bodyToo) {
      * this carrier picks up while this one is parked on the upstream, and two
      * concurrent ranges would swap their `Content-Range`.
      */
-    char *length = req->scratch + req->scratchUsed;
-    char *range;
     http_response_t answer = req.reply(ranged ? 206 : 200);
-
-    req->scratchUsed += 1 + snprintf(length,
-                                     (size_t)(META_HTTP_SCRATCH -
-                                              req->scratchUsed),
-                                     "%llu", want);
-
-    range = req->scratch + req->scratchUsed;
+    unsigned long long last = at + (want > 0 ? want - 1 : 0);
 
     answer = answer.header("ETag", held(req, what.etag))
-                 .header("Content-Length", length)
+                 .header("Content-Length", heldText(req, TEXT`${want}`))
                  .header("Accept-Ranges", "bytes")
                  .mime(held(req, what.mime[0] != 0
                                      ? what.mime
@@ -591,14 +581,10 @@ static http_response_t getObject(http_request_t *req, int bodyToo) {
     if (what.when[0] != 0)
       answer = answer.header("Last-Modified", held(req, what.when));
 
-    if (ranged) {
-      req->scratchUsed +=
-          1 + snprintf(range,
-                       (size_t)(META_HTTP_SCRATCH - req->scratchUsed),
-                       "bytes %llu-%llu/%llu", at,
-                       at + (want > 0 ? want - 1 : 0), what.how.plain);
-      answer = answer.header("Content-Range", range);
-    }
+    if (ranged)
+      answer = answer.header(
+          "Content-Range",
+          heldText(req, TEXT`bytes ${at}-${last}/${what.how.plain}`));
 
     if (!bodyToo || want == 0)
       return answer.send();
@@ -659,6 +645,139 @@ static http_response_t onDelete(http_request_t *req) {
 
 /* ---------------------------------------------------------------- buckets */
 
+/* ---------------------------------------------------------------- listing */
+
+/** `needle` in `[from, to)`, or NULL. The body is NUL-terminated past `to`. */
+static const char *within(const char *from, const char *to,
+                          const char *needle) {
+
+  const char *found = strstr(from, needle);
+
+  return found != NULL && found < to ? found : NULL;
+}
+
+/**
+ * Whether one `<Contents>` or `<CommonPrefixes>` entry names something under
+ * the scratch prefix.
+ *
+ * The name is compared as it came and percent-decoded as well, because a
+ * client that asked for `encoding-type=url` gets every name encoded and the
+ * slash in the prefix with it.
+ */
+static int hidden(const char *open, const char *shut) {
+
+  const char *name = within(open, shut, "<Key>");
+  size_t skip = 5;
+  const char *end;
+  char raw[S3SEAL_KEY_MAX * 3 + 1];
+  char plain[S3SEAL_KEY_MAX + 1];
+
+  if (name == NULL) {
+    name = within(open, shut, "<Prefix>");
+    skip = 8;
+  }
+
+  if (name == NULL)
+    return 0;
+
+  name += skip;
+  end = within(name, shut, "</");
+
+  if (end == NULL || (size_t)(end - name) >= sizeof raw)
+    return 0;
+
+  memcpy(raw, name, (size_t)(end - name));
+  raw[end - name] = 0;
+
+  s3seal_unescape(raw, plain, sizeof plain);
+
+  return s3seal_settings.ours(raw) || s3seal_settings.ours(plain);
+}
+
+/**
+ * The next entry at or after `at`, with `*shut` set past its end - or NULL.
+ *
+ * Where each kind was last seen is kept in `seen`, so a listing of a thousand
+ * keys is searched once from front to back rather than once per key. Start
+ * both at the body.
+ */
+static const char *nextEntry(const char *at, const char *seen[2],
+                             const char **shut) {
+
+  static const char *const opens[2] = {"<Contents>", "<CommonPrefixes>"};
+  static const char *const shuts[2] = {"</Contents>", "</CommonPrefixes>"};
+  int which = -1;
+
+  for (int kind = 0; kind < 2; ++kind) {
+
+    /* behind us, or not yet looked for: `seen` starts out at the body */
+    if (seen[kind] != NULL &&
+        (seen[kind] < at ||
+         strncmp(seen[kind], opens[kind], strlen(opens[kind])) != 0))
+      seen[kind] = strstr(at, opens[kind]);
+
+    if (seen[kind] != NULL && (which < 0 || seen[kind] < seen[which]))
+      which = kind;
+  }
+
+  if (which < 0)
+    return NULL;
+
+  *shut = strstr(seen[which], shuts[which]);
+
+  if (*shut == NULL)
+    return NULL;
+
+  *shut += strlen(shuts[which]);
+
+  return seen[which];
+}
+
+/**
+ * `[from, to)` copied out, with the one number inside `tag` rewritten.
+ *
+ * `<Size>` becomes the plaintext size - unless the stored size is not one a
+ * sealed object can have, which means the object was there before we were
+ * and its size is already the truth. `<KeyCount>` loses the entries that
+ * were hidden.
+ */
+static void copyRewriting(s3seal_buf_t *out, const char *from, const char *to,
+                          const char *tag, unsigned long long hiddenCount) {
+
+  const char *found = within(from, to, tag);
+  const char *value;
+  const char *stop;
+  unsigned long long said;
+
+  if (found == NULL) {
+    out->addn(from, (size_t)(to - from));
+    return;
+  }
+
+  value = found + strlen(tag);
+  stop = within(value, to, "<");
+
+  if (stop == NULL) {
+    out->addn(from, (size_t)(to - from));
+    return;
+  }
+
+  said = strtoull(value, NULL, 10);
+
+  out->addn(from, (size_t)(value - from));
+
+  if (tag[1] == 'S') {
+    int ok = 0;
+    unsigned long long plain = s3seal_plainSize(said, &ok);
+
+    out->addText(TEXT`${ok ? plain : said}`);
+  } else {
+    out->addText(TEXT`${said > hiddenCount ? said - hiddenCount : 0}`);
+  }
+
+  out->addn(stop, (size_t)(to - stop));
+}
+
 /**
  * A listing, with the sizes put right.
  *
@@ -669,44 +788,57 @@ static http_response_t onDelete(http_request_t *req) {
  * fixed stride and the arithmetic runs backwards.
  *
  * The scratch prefix is dropped on the way past, since parts of an upload in
- * progress are ours and not the bucket's.
+ * progress are ours and not the bucket's: every `<Contents>` under it, and
+ * every `<CommonPrefixes>` that is inside it. A common prefix that merely
+ * *leads* to it - `.s3seal/` in a listing with a delimiter - stays, because a
+ * client may keep keys of its own under that, and hiding a client's keys is
+ * worse than showing one folder too many.
+ *
+ * Two passes, because `<KeyCount>` comes before the entries it counts.
  */
 static http_response_t listing(http_request_t *req, fetch_answer_t *got) {
 
   s3seal_buf_t *out = &s3seal_answer;
-  const char *at = got->body != NULL ? got->body : "";
+  const char *body = got->body != NULL ? got->body : "";
+  const char *end = body + strlen(body);
+  const char *seen[2] = {body, body};
+  const char *shut = NULL;
+  const char *entry;
+  const char *at;
+  unsigned long long hiddenCount = 0;
 
   out->count = 0;
   out->broke = 0;
 
-  while (*at != 0) {
+  for (at = body; (entry = nextEntry(at, seen, &shut)) != NULL; at = shut)
+    hiddenCount += (unsigned long long)hidden(entry, shut);
 
-    const char *size = strstr(at, "<Size>");
-    const char *stop;
-    unsigned long long stored;
-    int ok = 0;
+  seen[0] = body;
+  seen[1] = body;
+  entry = nextEntry(body, seen, &shut);
 
-    if (size == NULL) {
-      out->add(at);
-      break;
-    }
+  /* everything in front of the first entry, which is where the count is */
+  copyRewriting(out, body, entry != NULL ? entry : end, "<KeyCount>",
+                hiddenCount);
 
-    stop = strstr(size, "</Size>");
+  while (entry != NULL) {
 
-    if (stop == NULL) {
-      out->add(at);
-      break;
-    }
+    const char *after = shut;
+    const char *next;
 
-    out->addn(at, (size_t)(size - at));
-    out->add("<Size>");
+    if (!hidden(entry, after))
+      copyRewriting(out, entry, after, "<Size>", 0);
 
-    stored = strtoull(size + 6, NULL, 10);
+    next = nextEntry(after, seen, &shut);
 
-    out->addf("%llu", s3seal_plainSize(stored, &ok));
+    /* whatever sits between two entries, or after the last one */
+    out->addn(after, (size_t)((next != NULL ? next : end) - after));
 
-    at = stop;
+    entry = next;
   }
+
+  if (out->broke)
+    return problem(req, 500, "InternalError", "out of memory");
 
   return req.reply(200).bytes("application/xml", out->at, out->count);
 }
@@ -978,10 +1110,10 @@ void s3seal_stop(void) {
 
   s3seal_serving = 0;
 
-  /* the upstream pushes finish before the client that started them goes */
+  /* the upstream pushes finish, and its connections close, before the
+     settings they were made with go */
   s3seal_upstream.stop();
 
-  meta_fetchDone();
   s3seal_settings.drop();
 }
 

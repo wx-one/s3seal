@@ -229,8 +229,12 @@ void s3seal_sign(void *with, fetch_call_t *call) {
   defer canonical.drop();
   defer toSign.drop();
 
-  s3seal_amzTime(s3seal_now(), amzDate, sizeof amzDate);
-  s3seal_amzDay(s3seal_now(), day, sizeof day);
+  /* one reading of the clock, so the date and the scope's day cannot fall
+     either side of midnight */
+  long long now = s3seal_now();
+
+  s3seal_amzTime(now, amzDate, sizeof amzDate);
+  s3seal_amzDay(now, day, sizeof day);
 
   hostOf(call->url, host, sizeof host);
   pathOf(call->url, path, sizeof path);
@@ -302,11 +306,11 @@ void s3seal_sign(void *with, fetch_call_t *call) {
 
   /* ------------------------------------------------- the canonical request */
 
-  canonical.addf("%s\n%s\n%s\n", call->method, path, query);
+  canonical.addText(TEXT`${call->method}\n${path}\n${query}\n`);
 
   for (size_t at = 0; at < count; ++at) {
 
-    canonical.addf("%s:%s\n", fields[at].name, fields[at].value);
+    canonical.addText(TEXT`${fields[at].name}:${fields[at].value}\n`);
 
     {
       size_t used = strlen(signed_);
@@ -336,7 +340,7 @@ void s3seal_sign(void *with, fetch_call_t *call) {
     }
   }
 
-  canonical.addf("\n%s\n%s", signed_, bodyHash);
+  canonical.addText(TEXT`\n${signed_}\n${bodyHash}`);
 
   if (canonical.broke)
     return;
@@ -346,7 +350,7 @@ void s3seal_sign(void *with, fetch_call_t *call) {
   snprintf(scope, sizeof scope, "%s/%s/%s/aws4_request", day, who->region,
            who->service != NULL ? who->service : "s3");
 
-  toSign.addf("AWS4-HMAC-SHA256\n%s\n%s\n%s", amzDate, scope, digest);
+  toSign.addText(TEXT`AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${digest}`);
 
   if (toSign.broke)
     return;

@@ -30,7 +30,7 @@ done
     "$here/tests/unit.c" >"$work/unit.log" 2>&1 || {
   echo "lowering unit.c failed"; sed -n '1,10p' "$work/unit.log"; exit 1; }
 
-cc -Wall -Wextra -Werror -std=gnu11 -D_GNU_SOURCE -O2 -I"$work" \
+cc -Wall -Wextra -Werror -std=gnu11 -D_GNU_SOURCE -O2 -I"$work" -I"$runtime" \
     -o "$work/unit" "$work/unit.c" "$work/util.c" "$work/frame.c" \
     -lcrypto 2>"$work/build.log" || {
   echo "the format would not compile"

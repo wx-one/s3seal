@@ -1330,7 +1330,7 @@ int s3seal_proxy_t.finish(s3seal_proxy_t *self, const char *id,
     tag = copied.body != NULL ? strstr(copied.body, "<ETag>") : NULL;
     shut = tag != NULL ? strstr(tag + 6, "</ETag>") : NULL;
 
-    done.addf("<Part><PartNumber>%d</PartNumber><ETag>", parts[at].number);
+    done.addText(TEXT`<Part><PartNumber>${parts[at].number}</PartNumber><ETag>`);
 
     if (tag != NULL && shut != NULL)
       done.addn(tag + 6, (size_t)(shut - tag - 6));
@@ -1580,6 +1580,14 @@ void s3seal_proxy_t.stop(s3seal_proxy_t *self) {
   (void)self;
 
   join pushers;
+
+  /**
+   * Here and not in s3.c, because the kept connections are per translation
+   * unit: `meta_fetch.h` is header-only and its pool is `static`, so this is
+   * the only file whose pool has anything in it. Called from anywhere else it
+   * closes an empty pool and leaves these open until the process goes.
+   */
+  meta_fetchDone();
 }
 
 /** Everything, however full the pipe is; parks rather than spins. */

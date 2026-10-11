@@ -1,5 +1,4 @@
 #include "sigv4.h"
-#include "crypt.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -385,10 +384,8 @@ s3seal_auth_t s3seal_verify(s3seal_config_t *config, http_request_t *req,
 
   s3seal_sha256Hex(canonical.at, canonical.count, digest);
 
-  toSign.add("AWS4-HMAC-SHA256\n");
-  toSign.add(sig.amzDate);
-  toSign.add("\n");
-  toSign.addf("%s/%s/%s/aws4_request\n", sig.day, sig.region, sig.service);
+  toSign.addText(TEXT`AWS4-HMAC-SHA256\n${sig.amzDate}\n`);
+  toSign.addText(TEXT`${sig.day}/${sig.region}/${sig.service}/aws4_request\n`);
   toSign.add(digest);
 
   if (canonical.broke || toSign.broke)
