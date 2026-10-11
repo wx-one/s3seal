@@ -14,7 +14,7 @@ set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build="$here/build"
-binary=${NGINX_BINARY:-/home/tobi/serious_projects/nginx/objs/nginx}
+binary=${NGINX_BINARY:-$here/../nginx/objs/nginx}
 
 port=${S3SEAL_TEST_PORT:-9557}
 upstreamPort=${S3SEAL_TEST_UPSTREAM_PORT:-9558}
@@ -47,11 +47,19 @@ same() {
   fi
 }
 
-command -v docker >/dev/null 2>&1 || { say "skipped: no docker"; exit 0; }
-command -v aws >/dev/null 2>&1 || { say "skipped: no aws cli"; exit 0; }
-[ -x "$binary" ] || { say "skipped: no nginx at $binary"; exit 0; }
-[ -f "$build/nginx/objs/ngx_http_meta_module.so" ] || {
-  say "skipped: no module - run ./build.sh"; exit 0; }
+# Skipped on a machine that lacks one of these - but not on CI, where a
+# skipped suite is a green run that tested nothing.
+skip() {
+  say "skipped: $1"
+  [ -n "${CI:-}" ] && exit 1
+  exit 0
+}
+
+command -v docker >/dev/null 2>&1 || skip "no docker"
+command -v aws >/dev/null 2>&1 || skip "no aws cli"
+[ -x "$binary" ] || skip "no nginx at $binary"
+[ -f "$build/nginx/objs/ngx_http_meta_module.so" ] ||
+  skip "no module - run ./build.sh"
 
 work=$(mktemp -d)
 home="$work/home"
@@ -233,6 +241,21 @@ curl -s $sig -H "Range: bytes=99990-99999" -o "$work/r3" \
     "http://127.0.0.1:$port/sealed/a.bin"
 dd if="$work/a.bin" bs=1 skip=99990 count=10 of="$work/r3.want" 2>/dev/null
 same "and the last ten bytes" "$work/r3" "$work/r3.want"
+
+# A key many segments deep. The router cuts a path into a fixed number of
+# segments - META_HTTP_SEGMENTS - and a `*key` tail past that comes back cut
+# short, which stores the object under a name the client never gave.
+deep=a/b/c/d/e/f/g/h/i/j/k/l/deep.bin
+
+s3 s3 cp "$work/a.bin" "s3://sealed/$deep" >/dev/null
+check "a key thirteen segments deep is stored under its own name" \
+    "$(raw s3api head-object --bucket sealed --key "$deep" \
+         --query ContentLength --output text 2>/dev/null | grep -c '^[0-9]')" "1"
+
+s3 s3 cp "s3://sealed/$deep" "$work/deep.back" >/dev/null
+same "and comes back under it" "$work/a.bin" "$work/deep.back"
+
+s3 s3 rm "s3://sealed/$deep" >/dev/null
 
 # ---------------------------------------------------------------- listings
 

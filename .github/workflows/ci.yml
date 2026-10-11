@@ -1,0 +1,82 @@
+# The module built, the format tested on its own, and the proxy end to end:
+# the real nginx, the real module, MinIO behind it and the aws CLI in front.
+#
+# meta is not open source. The metalanguage repository publishes it, binary
+# and headers, as the image wxone/meta, and this only uses it: copied out to
+# /opt/meta - see .github/actions/meta. The tag is the meta commit this is
+# built and tested with, not latest; META_IMAGE picks another.
+#
+# nginx is a release from nginx.org, configured the way build.sh copies it:
+# a module is refused at load by an nginx configured differently, so the
+# binary and the module come out of the same arguments. NGINX_VERSION picks
+# another.
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NGINX_VERSION: ${{ vars.NGINX_VERSION || '1.26.3' }}
+
+jobs:
+  test:
+    # meta lowers against the headers of the compiler its image was built
+    # with: ubuntu:24.04, so the runner is ubuntu-24.04 and uses its gcc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/meta
+        with:
+          image: ${{ vars.META_IMAGE || 'wxone/meta:90db752' }}
+
+      - name: system packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends build-essential \
+            libssl-dev libcurl4-openssl-dev
+
+      # no rewrite and no gzip, so nginx needs neither PCRE nor zlib
+      - name: nginx (cached by version)
+        id: nginx
+        uses: actions/cache@v4
+        with:
+          path: nginx
+          key: nginx-${{ runner.os }}-${{ env.NGINX_VERSION }}-compat
+
+      - name: build nginx
+        if: steps.nginx.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz" | tar xz
+          mv "nginx-$NGINX_VERSION" nginx
+          cd nginx
+          ./configure --with-compat --without-http_rewrite_module \
+            --without-http_gzip_module
+          make -j"$(nproc)"
+
+      - name: build
+        env:
+          NGINX_SOURCE: ${{ github.workspace }}/nginx
+        run: ./build.sh
+
+      - name: the format
+        run: tests/run.sh
+
+      - name: end to end
+        env:
+          NGINX_BINARY: ${{ github.workspace }}/nginx/objs/nginx
+        run: tests/proxy.sh
+
+      - name: what the build said
+        if: failure()
+        run: |
+          for log in build/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"
+            cat "$log"
+            echo "::endgroup::"
+          done

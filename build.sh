@@ -8,9 +8,12 @@
 #
 # Where things are, all overridable:
 #
-#   META             the meta binary
-#   META_RUNTIME     meta's runtime include directory
+#   META_ROOT        meta: a metalanguage checkout, or /opt/meta out of the
+#                    wxone/meta image (../metalanguage)
+#   META             the meta binary ($META_ROOT/meta)
+#   META_RUNTIME     meta's runtime headers (what `meta -print-config` says)
 #   NGINX_SOURCE     an nginx *source tree* of the same version as the binary
+#                    (../nginx)
 #   NGINX_BINARY     the nginx that will load the module
 #
 # ------------------------------------------------------------------ two notes
@@ -32,9 +35,9 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 build="$here/build"
 addon="$build/addon"
 
-meta=${META:-/home/tobi/serious_projects/metalanguage/meta}
-runtime=${META_RUNTIME:-/home/tobi/serious_projects/metalanguage/runtime/include}
-source=${NGINX_SOURCE:-/home/tobi/serious_projects/nginx}
+root=${META_ROOT:-$here/../metalanguage}
+meta=${META:-$root/meta}
+source=${NGINX_SOURCE:-$here/../nginx}
 binary=${NGINX_BINARY:-$source/objs/nginx}
 
 # ---------------------------------------------------------------- the sizes
@@ -68,6 +71,10 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 [ -x "$meta" ] || { say "no meta at $meta"; exit 2; }
+
+# asked rather than assumed: a checkout and an installed meta keep their
+# headers in different places, and meta knows which it is
+runtime=${META_RUNTIME:-$("$meta" -print-config | sed -n 's/^runtime-include=//p')}
 [ -f "$source/src/core/nginx.h" ] || { say "no nginx source at $source"; exit 2; }
 
 mkdir -p "$addon"

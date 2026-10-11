@@ -7,8 +7,9 @@
 set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-meta=${META:-/home/tobi/serious_projects/metalanguage/meta}
-runtime=${META_RUNTIME:-/home/tobi/serious_projects/metalanguage/runtime/include}
+root=${META_ROOT:-$here/../metalanguage}
+meta=${META:-$root/meta}
+runtime=${META_RUNTIME:-$("$meta" -print-config | sed -n 's/^runtime-include=//p')}
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

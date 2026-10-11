@@ -9,7 +9,7 @@ set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build="$here/build"
-binary=${NGINX_BINARY:-/home/tobi/serious_projects/nginx/objs/nginx}
+binary=${NGINX_BINARY:-$here/../nginx/objs/nginx}
 
 port=${S3SEAL_BENCH_PORT:-9561}
 upstreamPort=${S3SEAL_BENCH_UPSTREAM_PORT:-9562}
