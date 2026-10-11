@@ -97,6 +97,12 @@ Not written yet:
 
     ./build.sh
 
+`build.sh` wants meta and an nginx source tree of the same version as the
+nginx that will load the module. By default both sit beside this checkout -
+`../metalanguage` and `../nginx` - and `META_ROOT` and `NGINX_SOURCE` say
+otherwise; `META_ROOT=/opt/meta` is meta as the `wxone/meta` image ships it,
+which is what CI uses (`.github/workflows/ci.yml`).
+
     S3SEAL_UPSTREAM=https://s3.eu-central-1.amazonaws.com \
     S3SEAL_UPSTREAM_ACCESS=... S3SEAL_UPSTREAM_SECRET=... \
     ./run.sh
@@ -177,3 +183,10 @@ Framing costs **0.038%** on the wire: 25 bytes per 64 KiB frame.
 
 Written in metalang, on `meta_fetch.h` — which was written for this and is
 documented in `doc/fetch.md` of the metalanguage tree.
+
+## Licence
+
+s3seal is licensed under the European Union Public Licence, version 1.2
+(EUPL-1.2), in `LICENSE`. The EUPL is valid in all official languages of the
+EU; the other language versions are published at
+https://joinup.ec.europa.eu/collection/eupl.
