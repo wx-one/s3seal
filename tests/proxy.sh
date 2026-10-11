@@ -257,6 +257,30 @@ same "and comes back under it" "$work/a.bin" "$work/deep.back"
 
 s3 s3 rm "s3://sealed/$deep" >/dev/null
 
+# A key that cannot be stored as given is refused, not cut: past 1024 bytes
+# it used to land under its first 1024. A %00 never gets as far as s3seal -
+# nginx refuses it in the request line - and this says it stays that way.
+#
+# In segments of a hundred, because MinIO itself refuses a segment longer
+# than 255 bytes - one long run would be refused upstream and prove nothing.
+long=$(python3 -c "print('/'.join(['k' * 100] * 10) + '/' + 'k' * 15)")
+
+# shellcheck disable=SC2086
+check "a key of 1025 bytes is refused" \
+    "$(curl -s $sig -X PUT --data-binary x \
+         "http://127.0.0.1:$port/sealed/$long" | grep -c '<Code>KeyTooLongError</Code>')" "1"
+
+check "and nothing is stored under its first 1024" \
+    "$(raw s3 ls --recursive s3://sealed/ | grep -c 'kkkk')" "0"
+
+# shellcheck disable=SC2086
+check "a key with a NUL in it is refused" \
+    "$(curl -s $sig -o /dev/null -w '%{http_code}' -X PUT --data-binary x \
+         "http://127.0.0.1:$port/sealed/before%00after")" "400"
+
+check "and nothing is stored under what came before it" \
+    "$(raw s3 ls s3://sealed/ | grep -c 'before')" "0"
+
 # ---------------------------------------------------------------- listings
 
 check "a listing reports the plaintext size" \

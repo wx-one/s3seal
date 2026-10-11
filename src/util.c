@@ -71,56 +71,6 @@ int s3seal_startsWith(const char *text, const char *with) {
   return strncmp(text, with, length) == 0;
 }
 
-/**
- * Lowercase letters, digits, dot and dash; three to sixty-three of them;
- * starting and ending on a letter or a digit.
- *
- * Narrower than AWS, which also allows a name that looks like an address.
- * A bucket ends up in a directory name and one day in a host name, and both
- * have opinions about what a name is.
- */
-int s3seal_bucketOk(const char *name) {
-
-  size_t length = strlen(name);
-
-  if (length < 3 || length > S3SEAL_BUCKET_MAX)
-    return 0;
-
-  for (size_t at = 0; at < length; ++at) {
-
-    char one = name[at];
-    int ordinary = (one >= 'a' && one <= 'z') || (one >= '0' && one <= '9');
-
-    if (ordinary)
-      continue;
-
-    if (one in {'.', '-'} && at != 0 && at + 1 != length)
-      continue;
-
-    return 0;
-  }
-
-  return 1;
-}
-
-/**
- * Non-empty, under S3's limit, and no control characters - which an XML
- * listing cannot carry back to the client that chose them.
- */
-int s3seal_keyOk(const char *key) {
-
-  size_t length = strlen(key);
-
-  if (length == 0 || length > S3SEAL_KEY_MAX)
-    return 0;
-
-  for (size_t at = 0; at < length; ++at)
-    if ((unsigned char)key[at] < 0x20)
-      return 0;
-
-  return 1;
-}
-
 void s3seal_toHex(const unsigned char *from, size_t length, char *into) {
 
   static const char digits[] = "0123456789abcdef";
@@ -381,30 +331,38 @@ void s3seal_buf_t.drop(s3seal_buf_t *self) {
 
 size_t s3seal_unescape(const char *from, char *into, size_t room) {
 
-  size_t wrote = 0;
+  size_t need = 0;
 
-  while (*from != 0 && wrote + 1 < room) {
+  while (*from != 0) {
+
+    char one = *from;
+    size_t step = 1;
 
     if (*from == '%' && from[1] != 0 && from[2] != 0) {
 
-      unsigned char one;
+      unsigned char decoded;
       char pair[3];
 
       pair[0] = from[1];
       pair[1] = from[2];
       pair[2] = 0;
 
-      if (s3seal_fromHex(pair, &one, 1) == 1) {
-        into[wrote++] = (char)one;
-        from += 3;
-        continue;
+      if (s3seal_fromHex(pair, &decoded, 1) == 1) {
+        one = (char)decoded;
+        step = 3;
       }
     }
 
-    into[wrote++] = *from++;
+    /* never ahead of the reading: in place stays safe */
+    if (need + 1 < room)
+      into[need] = one;
+
+    ++need;
+    from += step;
   }
 
-  into[wrote] = 0;
+  if (room > 0)
+    into[need < room ? need : room - 1] = 0;
 
-  return wrote;
+  return need;
 }

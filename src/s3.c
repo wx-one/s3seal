@@ -105,12 +105,43 @@ static const char *held(http_request_t *req, const char *text) {
   return heldText(req, TEXT`${text}`);
 }
 
-/** The key a `*key` pattern caught, percent-decoded. */
-static const char *keyOf(http_request_t *req, char *into, size_t room) {
+/**
+ * The key a `*key` pattern caught, percent-decoded - and zero, or why it is
+ * not a key this proxy will take.
+ *
+ * Refused rather than cut: a key longer than the buffer used to be stored
+ * under its first 1024 bytes - an object under a name the client never gave,
+ * and the client not told. S3 refuses it with `KeyTooLongError`.
+ *
+ * A `%00` would do the same, under whatever came before it. nginx refuses one
+ * in the request line before this is ever asked, so that check is here for
+ * the day the request comes from somewhere that does not.
+ */
+enum s3sealKeyRefusal { S3SEAL_KEY_TOO_LONG = 1, S3SEAL_KEY_NUL = 2 };
 
-  s3seal_unescape(req.param("key"), into, room);
+static int keyOf(http_request_t *req, char *into, size_t room) {
 
-  return into;
+  size_t length = s3seal_unescape(req.param("key"), into, room);
+
+  if (length >= room || length > S3SEAL_KEY_MAX)
+    return S3SEAL_KEY_TOO_LONG;
+
+  if (strlen(into) != length)
+    return S3SEAL_KEY_NUL;
+
+  return 0;
+}
+
+/** The answer for a key `keyOf` refused, asked again so callers stay short. */
+static http_response_t refusedKey(http_request_t *req) {
+
+  char key[S3SEAL_KEY_MAX + 1];
+
+  if (keyOf(req, key, sizeof key) == S3SEAL_KEY_TOO_LONG)
+    return problem(req, 400, "KeyTooLongError",
+                   "a key is at most 1024 bytes");
+
+  return problem(req, 400, "InvalidArgument", "a key cannot contain a NUL");
 }
 
 /* ------------------------------------------------------------ the doorman */
@@ -259,7 +290,9 @@ static http_response_t putObject(http_request_t *req) {
     char early[S3SEAL_KEY_MAX + 1];
     const char *encoding = req.header("content-encoding");
 
-    keyOf(req, early, sizeof early);
+    if (keyOf(req, early, sizeof early) != 0)
+
+      return refusedKey(req);
 
     if (s3seal_settings.ours(early))
       return problem(req, 403, "AccessDenied", "that prefix is the proxy's");
@@ -274,7 +307,9 @@ static http_response_t putObject(http_request_t *req) {
   body = req.readBody();
   afterBody = s3seal_now_ms();
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   if (s3seal_settings.ours(key))
     return problem(req, 403, "AccessDenied", "that prefix is the proxy's");
@@ -516,7 +551,9 @@ static http_response_t getObject(http_request_t *req, int bodyToo) {
   int status = 0;
   int ranged = 0;
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   if (s3seal_settings.ours(key))
     return problem(req, 404, "NoSuchKey", "no such key");
@@ -629,7 +666,9 @@ static http_response_t onDelete(http_request_t *req) {
   if (asked(req, "uploadId"))
     return abortUpload(req);
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   if (s3seal_settings.ours(key))
     return problem(req, 403, "AccessDenied", "that prefix is the proxy's");
@@ -930,7 +969,9 @@ static http_response_t startUpload(http_request_t *req) {
   const char *bucket = req.param("bucket");
   s3seal_buf_t *out = &s3seal_answer;
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   if (s3seal_settings.ours(key))
     return problem(req, 403, "AccessDenied", "that prefix is the proxy's");
@@ -964,7 +1005,9 @@ static http_response_t uploadPart(http_request_t *req) {
   s3seal_upload_t what;
   http_body_t body = req.readBody();
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   if (number < 1 || number > S3SEAL_PARTS_MAX)
     return problem(req, 400, "InvalidArgument", "that is not a part number");
@@ -1018,7 +1061,9 @@ static http_response_t finishUpload(http_request_t *req) {
   s3seal_upload_t what;
   s3seal_buf_t *out = &s3seal_answer;
 
-  keyOf(req, key, sizeof key);
+  if (keyOf(req, key, sizeof key) != 0)
+
+    return refusedKey(req);
 
   /* the client's part list is read and dropped: what was actually parked is
      what gets assembled, and that is what the listing says */

@@ -33,17 +33,6 @@ int s3seal_same(const char *a, const char *b);
 /** Whether `text` starts with `with`. */
 int s3seal_startsWith(const char *text, const char *with);
 
-/**
- * Whether a bucket name is one S3 would accept.
- *
- * Narrower than AWS on purpose: a name that is not this is a name that will
- * one day be a host name or a directory, and both have opinions.
- */
-int s3seal_bucketOk(const char *name);
-
-/** Whether a key is one we will store: non-empty, no NUL, under the limit. */
-int s3seal_keyOk(const char *key);
-
 /* ------------------------------------------------------------------ bytes */
 
 void s3seal_toHex(const unsigned char *from, size_t length, char *into);
@@ -104,7 +93,14 @@ int s3seal_buf_t.addUri(s3seal_buf_t *self, const char *text, int keepSlash);
 
 void s3seal_buf_t.drop(s3seal_buf_t *self);
 
-/** Percent-decoding, in place-safe form: `into` may be `from`. */
+/**
+ * Percent-decoding, in place-safe form: `into` may be `from`.
+ *
+ * Answers the whole decoded length, as `snprintf` does, and writes what fits.
+ * So an answer of `room` or more says the text was cut, and an answer that
+ * is not `strlen(into)` says a `%00` was in it - two things a caller deciding
+ * on a name has to know, and that the written text cannot say.
+ */
 size_t s3seal_unescape(const char *from, char *into, size_t room);
 
 #endif /* S3SEAL_UTIL_H */
