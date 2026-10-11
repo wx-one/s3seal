@@ -42,19 +42,17 @@ binary=${NGINX_BINARY:-$source/objs/nginx}
 
 # ---------------------------------------------------------------- the sizes
 #
-# S3's own limits, in meta_http's terms. A key may be 1024 bytes and go many
-# segments deep, and the router splits a path into a fixed number of them -
-# past which a `*key` tail would come back cut short, which is an object
-# quietly stored under the wrong name.
+# S3's own limits, in meta_http's terms: what a request may carry. These only
+# size `http_request_t`, which lives in this module, so they are ours to set.
 #
-# META_HTTP_ROUTES is not here: it sizes the `http_t` compiled into meta's
-# runtime archive, so meta fixes it (at 256) and refuses a redefinition.
-defines="-D META_HTTP_SEGMENTS=64 \
-         -D META_HTTP_SCRATCH=8192 \
+# META_HTTP_ROUTES and META_HTTP_SEGMENTS are not here: they size the `http_t`
+# compiled into meta's runtime archive, so meta fixes them and refuses a
+# redefinition. A key going deeper than SEGMENTS is no matter - a `*key` tail
+# takes the rest of the path as written, however many slashes are in it.
+defines="-D META_HTTP_SCRATCH=8192 \
          -D META_HTTP_HEADERS=64"
 
-cdefines="-DMETA_HTTP_SEGMENTS=64 \
-          -DMETA_HTTP_SCRATCH=8192 \
+cdefines="-DMETA_HTTP_SCRATCH=8192 \
           -DMETA_HTTP_HEADERS=64"
 
 # Every unit but the one with `main` in it. `-module` handles that one,

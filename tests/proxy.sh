@@ -264,9 +264,10 @@ curl -s $sig -H "Range: bytes=99990-99999" -o "$work/r3" \
 dd if="$work/a.bin" bs=1 skip=99990 count=10 of="$work/r3.want" 2>/dev/null
 same "and the last ten bytes" "$work/r3" "$work/r3.want"
 
-# A key many segments deep. The router cuts a path into a fixed number of
-# segments - META_HTTP_SEGMENTS - and a `*key` tail past that comes back cut
-# short, which stores the object under a name the client never gave.
+# A key more segments deep than the router splits a path into. A `*key` tail
+# takes the rest of the path as written; when it ended at the last segment
+# the split kept, a deep key came back cut short and the object was stored
+# under a name the client never gave.
 deep=a/b/c/d/e/f/g/h/i/j/k/l/deep.bin
 
 s3 s3 cp "$work/a.bin" "s3://sealed/$deep" >/dev/null
