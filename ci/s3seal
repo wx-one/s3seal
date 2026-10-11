@@ -1,0 +1,70 @@
+#!/bin/sh
+# Starts s3seal: nginx with the proxy built in. What run.sh does for a
+# development build, so the release needs nothing from meta at run time.
+#
+# The proxy runs inside nginx's master, writes the real configuration from
+# the program (port, routes, options) and has nginx read it. So this writes
+# only enough for nginx to start.
+#
+# On a first run it makes the seed and a credentials file, 0600 both, and
+# prints the access key it invented. Keep the seed: every object this proxy
+# wrote is sealed under keys derived from it.
+#
+#   S3SEAL_STATE_DIR      nginx's working directory, and where the seed and
+#                         the credentials are kept (default /var/lib/s3seal)
+#   S3SEAL_UPSTREAM       the S3 to sit in front of
+#   S3SEAL_UPSTREAM_ACCESS, S3SEAL_UPSTREAM_SECRET
+#   everything else: the S3SEAL_* settings in README.md
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+state=${S3SEAL_STATE_DIR:-/var/lib/s3seal}
+
+mkdir -p "$state/conf" "$state/logs"
+chmod 700 "$state"
+
+export S3SEAL_SEED=${S3SEAL_SEED:-$state/seed}
+export S3SEAL_CREDENTIALS=${S3SEAL_CREDENTIALS:-$state/credentials}
+
+# from /dev/urandom rather than openssl's command line, which a host running
+# only this release need not have
+if [ ! -f "$S3SEAL_SEED" ]; then
+  echo "s3seal: making a seed at $S3SEAL_SEED - keep it, without it every object sealed through here is noise"
+  ( umask 077 && head -c 32 /dev/urandom > "$S3SEAL_SEED" )
+fi
+
+if [ ! -f "$S3SEAL_CREDENTIALS" ]; then
+  access=s3seal$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n' | tr 'a-f' 'A-F')
+  secret=$(head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c1-40)
+  ( umask 077 && printf '%s %s\n' "$access" "$secret" > "$S3SEAL_CREDENTIALS" )
+  echo "s3seal: made credentials at $S3SEAL_CREDENTIALS"
+  echo "  access key: $access"
+  echo "  secret:     $secret"
+fi
+
+cat > "$state/conf/nginx.conf" <<CONF
+# Written by bin/s3seal, and replaced by s3seal a moment later.
+daemon off;
+error_log stderr info;
+pid logs/meta.pid;
+
+events { worker_connections 64; }
+
+http { }
+CONF
+
+# OpenSSL is linked in and was built with a directory of its own, so it does
+# not read this host's openssl.cnf; the trust store is this host's, found
+# where each distribution keeps it
+if [ -z "${SSL_CERT_FILE:-}" ]; then
+  for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+            /etc/ssl/ca-bundle.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/cert.pem; do
+    if [ -r "$ca" ]; then
+      export SSL_CERT_FILE="$ca"
+      break
+    fi
+  done
+fi
+[ -n "${SSL_CERT_FILE:-}" ] || echo "s3seal: no CA bundle found; set SSL_CERT_FILE for an upstream over https" >&2
+
+exec "$here/sbin/nginx" -c "$state/conf/nginx.conf" -p "$state"

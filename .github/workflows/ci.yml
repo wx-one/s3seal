@@ -1,19 +1,22 @@
-# The module built, the format tested on its own, and the proxy end to end:
-# the real nginx, the real module, MinIO behind it and the aws CLI in front.
+# The module built and tested, a release built from it and tested again, an
+# image of the release tested once more - and on a tag, both published.
 #
 # meta is not open source. The metalanguage repository publishes it, binary
 # and headers, as the image wxone/meta, and this only uses it: copied out to
-# /opt/meta - see .github/actions/meta. The tag is the meta commit this is
-# built and tested with, not latest; META_IMAGE picks another.
+# /opt/meta - see .github/actions/meta. Which one, by tag and digest, is in
+# ci/meta-image: the meta commit this is built and tested with, not latest.
 #
-# nginx is a release from nginx.org, configured the way build.sh copies it:
-# a module is refused at load by an nginx configured differently, so the
-# binary and the module come out of the same arguments. NGINX_VERSION picks
-# another.
+# test: the development build, as ./build.sh makes it - a dynamic module for
+# an nginx release from nginx.org, configured the way build.sh copies it (a
+# module is refused at load by an nginx configured differently, so the binary
+# and the module come out of the same arguments). NGINX_VERSION picks another.
 #
-# MinIO, the upstream the end-to-end test seals onto, is built from source:
-# MinIO no longer publishes images or binaries, and its repository is
-# archived. MINIO_RELEASE is the release the suite was last run against.
+# build, image: ci/build.sh - nginx with s3seal built in, every library but
+# glibc linked statically from pinned sources (ci/deps.sh). The end-to-end
+# suite runs against the release by its bin/s3seal, and against the image.
+#
+# MinIO, the upstream the suite seals onto, is built from source - see
+# .github/actions/minio. MINIO_RELEASE is the release it was last run against.
 name: ci
 
 on:
@@ -26,6 +29,7 @@ on:
 env:
   NGINX_VERSION: ${{ vars.NGINX_VERSION || '1.26.3' }}
   MINIO_RELEASE: ${{ vars.MINIO_RELEASE || 'RELEASE.2025-09-07T16-13-09Z' }}
+  IMAGE: ghcr.io/wx-one/s3seal
 
 jobs:
   test:
@@ -35,9 +39,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - id: pin
+        run: echo "image=$(cat ci/meta-image)" >>"$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/meta
         with:
-          image: ${{ vars.META_IMAGE || 'wxone/meta:51d441c' }}
+          image: ${{ steps.pin.outputs.image }}
 
       - name: system packages
         run: |
@@ -63,27 +70,9 @@ jobs:
             --without-http_gzip_module
           make -j"$(nproc)"
 
-      - name: minio (cached by release)
-        id: minio
-        uses: actions/cache@v4
+      - uses: ./.github/actions/minio
         with:
-          path: minio/minio
-          key: minio-${{ runner.os }}-${{ env.MINIO_RELEASE }}
-
-      - if: steps.minio.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache: false
-
-      - name: build minio
-        if: steps.minio.outputs.cache-hit != 'true'
-        run: |
-          git clone -q --depth 1 --branch "$MINIO_RELEASE" \
-            https://github.com/minio/minio minio-src
-          mkdir -p minio
-          (cd minio-src && CGO_ENABLED=0 go build -trimpath -o ../minio/minio .)
-          rm -rf minio-src
+          release: ${{ env.MINIO_RELEASE }}
 
       - name: build
         env:
@@ -108,3 +97,145 @@ jobs:
             cat "$log"
             echo "::endgroup::"
           done
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: pin
+        run: echo "image=$(cat ci/meta-image)" >>"$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/meta
+        with:
+          image: ${{ steps.pin.outputs.image }}
+
+      - name: build tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential curl ca-certificates perl xz-utils jq
+
+      - name: static libraries (cached by ci/deps.sh)
+        uses: actions/cache@v4
+        with:
+          path: out/deps
+          key: deps-${{ runner.os }}-${{ hashFiles('ci/deps.sh') }}
+
+      - name: build
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          [[ "$GITHUB_REF" == refs/tags/v* ]] || version=0.0.0-${GITHUB_SHA::12}
+          export META_REF="${{ steps.pin.outputs.image }}"
+          ci/build.sh "$version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            out/s3seal-*.tar.gz
+            out/s3seal-*.cdx.json
+            out/s3seal-*.sha256
+
+      - name: what the build said
+        if: failure()
+        run: |
+          for log in build/*.log out/work/*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"
+            cat "$log"
+            echo "::endgroup::"
+          done
+
+  image:
+    # the release on the hardened Debian 13 seed of container.gov.de; the
+    # end-to-end suite against the release as it unpacks, and against the image
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: out
+
+      - uses: ./.github/actions/minio
+        with:
+          release: ${{ env.MINIO_RELEASE }}
+
+      - name: end to end, the release
+        env:
+          MINIO_BINARY: ${{ github.workspace }}/minio/minio
+        run: |
+          release=$(basename out/s3seal-*.tar.gz .tar.gz)
+          echo "RELEASE=$release" >>"$GITHUB_ENV"
+          mkdir -p unpacked
+          tar -xzf "out/$release.tar.gz" -C unpacked
+          S3SEAL_RELEASE="$PWD/unpacked/$release" tests/proxy.sh
+
+      - name: build image
+        run: docker build -q -f ci/Dockerfile.release --build-arg RELEASE="$RELEASE" -t s3seal:ci out
+
+      - name: end to end, the image
+        env:
+          MINIO_BINARY: ${{ github.workspace }}/minio/minio
+        run: S3SEAL_IMAGE=s3seal:ci tests/proxy.sh
+
+      - name: image SBOM
+        run: |
+          seed=$(sed -n 's/^ARG SEED=//p' ci/Dockerfile.release)
+          docker create --name base-libs s3seal:ci >/dev/null
+          docker cp base-libs:/opt/s3seal/BASE-LIBS out/BASE-LIBS
+          docker rm base-libs >/dev/null
+          tag=${GITHUB_REF_NAME#v}
+          [[ "$GITHUB_REF" == refs/tags/v* ]] || tag=ci
+          ci/sbom.sh image "out/$RELEASE.cdx.json" out/BASE-LIBS "$seed" "$IMAGE:$tag" \
+            > "out/$RELEASE.image.cdx.json"
+
+      - name: push image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          tag=${GITHUB_REF_NAME#v}
+          docker tag s3seal:ci "$IMAGE:$tag"
+          docker push -q "$IMAGE:$tag"
+          docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag" > "out/$RELEASE.image-digest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: |
+            out/*.image.cdx.json
+            out/*.image-digest
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=$(cat out/*.image-digest)
+          {
+            echo "## Binary"
+            echo "\`s3seal-*-linux-x86_64.tar.gz\`: one binary, nginx with s3seal built in, everything but glibc (>= 2.38) linked statically; \`bin/s3seal\` starts it, \`s3seal.service\` is a systemd unit for it. SHA-256 in the \`.sha256\` file, SBOM (CycloneDX 1.6) in \`.cdx.json\`, licences in \`THIRD_PARTY_NOTICES\` inside the tarball."
+            echo
+            echo "## Image"
+            echo "\`$image\` - on the hardened Debian 13 runtime seed of container.gov.de. The seed and the credentials go to \`/run/s3seal\`, 0600 and owned by 65534. What it adds to the seed: \`.image.cdx.json\`."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" out/s3seal-* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md

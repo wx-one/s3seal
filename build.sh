@@ -4,6 +4,9 @@
 #
 #   ./build.sh              lower, build the module
 #   ./build.sh test         and then run the tests
+#   ./build.sh addon        only lower, into build/addon - for nginx's
+#                           --add-module, which is how ci/build.sh builds
+#                           the release
 #   ./build.sh clean        throw the build directory away
 #
 # Where things are, all overridable:
@@ -15,6 +18,10 @@
 #   NGINX_SOURCE     an nginx *source tree* of the same version as the binary
 #                    (../nginx)
 #   NGINX_BINARY     the nginx that will load the module
+#   S3SEAL_INCLUDE   a directory of headers ahead of the system's, for meta
+#                    and the C compiler both - the release's own OpenSSL
+#   S3SEAL_LIBS      added to the module's link line - the release's
+#                    libraries, as archives
 #
 # ------------------------------------------------------------------ two notes
 #
@@ -62,7 +69,9 @@ headers="s3seal util frame config sigv4 sign proxy s3"
 
 say() { printf '%s\n' "$*"; }
 
-if [ "${1:-}" = "clean" ]; then
+mode=${1:-}
+
+if [ "$mode" = "clean" ]; then
   rm -rf "$build"
   say "gone"
   exit 0
@@ -73,7 +82,11 @@ fi
 # asked rather than assumed: a checkout and an installed meta keep their
 # headers in different places, and meta knows which it is
 runtime=${META_RUNTIME:-$("$meta" -print-config | sed -n 's/^runtime-include=//p')}
-[ -f "$source/src/core/nginx.h" ] || { say "no nginx source at $source"; exit 2; }
+[ "$mode" = "addon" ] || [ -f "$source/src/core/nginx.h" ] ||
+  { say "no nginx source at $source"; exit 2; }
+
+includes="-I $here/src -I $runtime"
+[ -z "${S3SEAL_INCLUDE:-}" ] || includes="-I $S3SEAL_INCLUDE $includes"
 
 mkdir -p "$addon"
 
@@ -87,7 +100,7 @@ mkdir -p "$addon"
 say "lowering"
 
 for name in $headers; do
-  "$meta" -s -emit "$addon/$name.h" -I "$here/src" -I "$runtime" $defines \
+  "$meta" -s -emit "$addon/$name.h" $includes $defines \
       "$here/src/$name.h" >"$build/$name.h.log" 2>&1 || {
     say "  FAILED on src/$name.h"
     sed -n '1,10p' "$build/$name.h.log"
@@ -96,7 +109,7 @@ for name in $headers; do
 done
 
 for name in $units; do
-  "$meta" -s -emit "$addon/$name.c" -I "$here/src" -I "$runtime" $defines \
+  "$meta" -s -emit "$addon/$name.c" $includes $defines \
       "$here/src/$name.c" >"$build/$name.c.log" 2>&1 || {
     say "  FAILED on src/$name.c"
     sed -n '1,10p' "$build/$name.c.log"
@@ -116,8 +129,11 @@ for name in $units; do
   modsrcs="$modsrcs -module-src \$ngx_addon_dir/$name.c"
 done
 
+set --
+[ -z "${S3SEAL_LIBS:-}" ] || set -- -module-lib "$S3SEAL_LIBS"
+
 # shellcheck disable=SC2086
-"$meta" -s -module "$addon" -I "$here/src" -I "$runtime" $defines $modsrcs \
+"$meta" -s -module "$addon" $includes $defines $modsrcs "$@" \
     "$here/src/main.c" >"$build/main.log" 2>&1 || {
   say "  FAILED on src/main.c"
   sed -n '1,10p' "$build/main.log"
@@ -131,18 +147,24 @@ done
 # ------------------------------------------------------------- the addon config
 #
 # Two things meta has no flag for: the units' own lowered headers sit in the
-# addon directory, and the `-D` sizes have to reach the C compiler too.
+# addon directory (and S3SEAL_INCLUDE, when there is one), and the `-D` sizes
+# have to reach the C compiler too.
 # Rewritten rather than replaced wholesale, because the rest is meta's.
 
 say "adjusting the addon config"
 
-awk -v cdefines="$cdefines" '
-  /ngx_module_incs=/ { sub(/"$/, " $ngx_addon_dir\"") }
+awk -v cdefines="$cdefines" -v extra="${S3SEAL_INCLUDE:-}" '
+  /ngx_module_incs=/ { sub(/"$/, " $ngx_addon_dir" (extra != "" ? " " extra : "") "\"") }
   /\. auto\/module/  { print "    CFLAGS=\"$CFLAGS " cdefines "\"" }
   { print }
 ' "$addon/config" > "$addon/config.new"
 
 mv "$addon/config.new" "$addon/config"
+
+if [ "$mode" = "addon" ]; then
+  say "addon: $addon"
+  exit 0
+fi
 
 # ------------------------------------------------------------------ nginx
 #
@@ -210,6 +232,6 @@ say "nginx:  $binary"
 say ""
 say "  NGINX_BINARY=$binary ./run.sh"
 
-if [ "${1:-}" = "test" ]; then
+if [ "$mode" = "test" ]; then
   exec "$here/tests/run.sh"
 fi

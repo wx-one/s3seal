@@ -49,6 +49,14 @@ int main(void) {
   http.env("S3SEAL_TIMING");
 
   /**
+   * Where the trust store is, for an upstream over https. The release links
+   * its own OpenSSL, built not to read the host's configuration, so it is
+   * told - by bin/s3seal or the image - and the workers have to hear it too.
+   */
+  http.env("SSL_CERT_FILE");
+  http.env("SSL_CERT_DIR");
+
+  /**
    * The configuration is read in the master, before it forks; the seed and
    * the upstream client are opened in the worker, after it has.
    */

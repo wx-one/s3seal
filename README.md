@@ -112,11 +112,32 @@ key it invented. **Keep the seed.** Without it every object on the upstream is
 noise — which is the point, and also the risk.
 
     tests/run.sh          the format, no network needed
-    tests/proxy.sh        end to end, needs docker and the aws cli
+    tests/proxy.sh        end to end, needs MinIO (MINIO_BINARY, or
+                          docker) and the aws cli
     tests/bench.sh [MB]   what the sealing costs
     tests/pump.py         a PUT, timed only while bytes move
     tests/drain.py        a GET, timed only after the first byte
     tests/mixed.py        many clients at once, reading and writing
+
+## Releases
+
+A tag `v*` publishes one on GitHub, built by `ci/build.sh` and tested end to
+end before it goes out:
+
+- `s3seal-<version>-linux-x86_64.tar.gz` - nginx with s3seal built in, every
+  library but glibc (>= 2.38) linked statically. Unpacked to `/opt/s3seal`,
+  `bin/s3seal` starts it and makes the seed and credentials in
+  `/var/lib/s3seal` on a first start; `s3seal.service` is a systemd unit for
+  it, reading `S3SEAL_*` from `/etc/s3seal.env`. Beside it its SHA-256 and a
+  CycloneDX SBOM.
+- `ghcr.io/wx-one/s3seal:<version>` - the same on the hardened Debian 13 seed
+  of container.gov.de, no shell. The seed and the credentials are mounted at
+  `/run/s3seal`, 0600 and owned by 65534, the user it runs as.
+
+        docker run -p 9000:9000 -v /srv/s3seal:/run/s3seal:ro \
+            -e S3SEAL_UPSTREAM=https://s3.eu-central-1.amazonaws.com \
+            -e S3SEAL_UPSTREAM_ACCESS=... -e S3SEAL_UPSTREAM_SECRET=... \
+            ghcr.io/wx-one/s3seal:<version>
 
 ## What it costs
 

@@ -3,7 +3,9 @@
 # s3seal end to end: the real nginx, the real module, a real S3 behind it and
 # real S3 clients in front.
 #
-#   tests/proxy.sh
+#   tests/proxy.sh                          the module ./build.sh built
+#   S3SEAL_RELEASE=<dir> tests/proxy.sh     an unpacked release, by its bin/s3seal
+#   S3SEAL_IMAGE=<image> tests/proxy.sh     the image, run as it ships
 #
 # The upstream is a MinIO, started here and stopped on the way out: the binary
 # MINIO_BINARY names, or else a container of quay.io/minio/minio - which only
@@ -22,6 +24,7 @@ binary=${NGINX_BINARY:-$here/../nginx/objs/nginx}
 port=${S3SEAL_TEST_PORT:-9557}
 upstreamPort=${S3SEAL_TEST_UPSTREAM_PORT:-9558}
 container=s3seal-test-minio
+proxyContainer=s3seal-test-proxy
 
 failed=0
 ran=0
@@ -64,17 +67,28 @@ else
   command -v docker >/dev/null 2>&1 || skip "no docker"
 fi
 command -v aws >/dev/null 2>&1 || skip "no aws cli"
-[ -x "$binary" ] || skip "no nginx at $binary"
-[ -f "$build/nginx/objs/ngx_http_meta_module.so" ] ||
-  skip "no module - run ./build.sh"
+if [ -n "${S3SEAL_IMAGE:-}" ]; then
+  command -v docker >/dev/null 2>&1 || skip "no docker"
+elif [ -n "${S3SEAL_RELEASE:-}" ]; then
+  [ -x "$S3SEAL_RELEASE/bin/s3seal" ] || skip "no release at $S3SEAL_RELEASE"
+else
+  [ -x "$binary" ] || skip "no nginx at $binary"
+  [ -f "$build/nginx/objs/ngx_http_meta_module.so" ] ||
+    skip "no module - run ./build.sh"
+fi
 
 work=$(mktemp -d)
 home="$work/home"
 mkdir -p "$home"
 
 stop() {
-  [ -f "$home/nginx/logs/meta.pid" ] &&
-      kill "$(cat "$home/nginx/logs/meta.pid" 2>/dev/null)" 2>/dev/null
+  if [ -n "${S3SEAL_IMAGE:-}" ]; then
+    docker rm -f "$proxyContainer" >/dev/null 2>&1
+  fi
+  # run.sh keeps nginx's files under nginx/, a release's bin/s3seal at the top
+  for pid in "$home/nginx/logs/meta.pid" "$home/logs/meta.pid"; do
+    [ -f "$pid" ] && kill "$(cat "$pid" 2>/dev/null)" 2>/dev/null
+  done
   if [ -n "${upstreamPid:-}" ]; then
     kill "$upstreamPid" 2>/dev/null
   else
@@ -120,10 +134,36 @@ ran=$((ran + 1))
 
 # ---------------------------------------------------------------- the proxy
 
-S3SEAL_HOME="$home" S3SEAL_PORT="$port" \
-    S3SEAL_UPSTREAM="http://127.0.0.1:$upstreamPort" \
-    S3SEAL_UPSTREAM_ACCESS=sealtest S3SEAL_UPSTREAM_SECRET=sealtest123 \
-    "$here/run.sh" >"$work/server.log" 2>&1 &
+# The seed and the credentials made here rather than by what starts the
+# proxy, because the image has nothing that would make them. run.sh and
+# bin/s3seal find them and leave them as they are.
+( umask 077 &&
+  head -c 32 /dev/urandom > "$home/seed" &&
+  printf 's3sealTEST%s %s\n' "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" \
+      "$(head -c 30 /dev/urandom | base64 | tr -d '/+=\n')" > "$home/credentials" )
+
+export S3SEAL_PORT="$port"
+export S3SEAL_UPSTREAM="http://127.0.0.1:$upstreamPort"
+export S3SEAL_UPSTREAM_ACCESS=sealtest S3SEAL_UPSTREAM_SECRET=sealtest123
+
+if [ -n "${S3SEAL_IMAGE:-}" ]; then
+  # the secrets go in as the image wants them: at /run/s3seal, 0600 and the
+  # container user's - by docker cp from a tar that says so, which needs no
+  # root on this side
+  docker rm -f "$proxyContainer" >/dev/null 2>&1
+  docker create --name "$proxyContainer" --network host \
+      -e S3SEAL_PORT -e S3SEAL_UPSTREAM \
+      -e S3SEAL_UPSTREAM_ACCESS -e S3SEAL_UPSTREAM_SECRET \
+      "$S3SEAL_IMAGE" >/dev/null
+  tar -C "$home" --owner=65534 --group=65534 --numeric-owner -cf - \
+      seed credentials | docker cp -a - "$proxyContainer:/run/s3seal"
+  docker start -a "$proxyContainer" >"$work/server.log" 2>&1 &
+elif [ -n "${S3SEAL_RELEASE:-}" ]; then
+  S3SEAL_STATE_DIR="$home" "$S3SEAL_RELEASE/bin/s3seal" \
+      >"$work/server.log" 2>&1 &
+else
+  S3SEAL_HOME="$home" "$here/run.sh" >"$work/server.log" 2>&1 &
+fi
 
 waited=0
 while [ "$waited" -lt 60 ]; do

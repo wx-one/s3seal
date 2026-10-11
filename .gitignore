@@ -1,5 +1,6 @@
-# what the build makes
+# what the build makes, and the release
 build/
+out/
 
 # what a running proxy keeps - and two of these are secrets. `var-*` too,
 # because a second instance on the same machine wants its own home and the

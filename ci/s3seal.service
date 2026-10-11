@@ -1,0 +1,29 @@
+# systemd unit for a release unpacked to /opt/s3seal.
+# Settings (S3SEAL_*) in /etc/s3seal.env; the seed and the credentials are
+# made in /var/lib/s3seal on the first start, unless S3SEAL_SEED and
+# S3SEAL_CREDENTIALS name others.
+[Unit]
+Description=s3seal - an S3 proxy that encrypts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=s3seal
+Group=s3seal
+EnvironmentFile=/etc/s3seal.env
+Environment=S3SEAL_STATE_DIR=/var/lib/s3seal
+StateDirectory=s3seal
+StateDirectoryMode=0700
+ExecStart=/opt/s3seal/bin/s3seal
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/s3seal
+
+[Install]
+WantedBy=multi-user.target
