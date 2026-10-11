@@ -13,6 +13,9 @@
 #include <openssl/md5.h>
 #include <openssl/rand.h>
 
+/* meta knows its own headers' libraries and not OpenSSL's, so it is told */
+#pragma meta needs "-lcrypto"
+
 #include <errno.h>
 #include <stdint.h>
 #include <fcntl.h>

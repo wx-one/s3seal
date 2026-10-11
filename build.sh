@@ -109,9 +109,13 @@ done
 # `-module` writes three files: the lowered program, the nginx module around
 # it, and the `config` nginx's --add-dynamic-module reads.
 #
-# It knows only main.c, so the other units are named to it, and so are the
-# libraries they need: meta derives a link line from main.c's own includes,
-# and main.c includes neither OpenSSL nor the fetch client.
+# It knows only main.c, so the other units are named to it. The link line it
+# works out from all of them: libcurl from meta_fetch.h, which meta knows.
+#
+# libcrypto it is told twice, and only the second one counts yet. frame.c
+# says `#pragma meta needs "-lcrypto"`, but a `-module-src` is read where the
+# module will find it - the *lowered* frame.c in the addon directory - and
+# lowering drops the pragma. Until it keeps it, -module-lib says it again.
 modsrcs=""
 for name in $units; do
   modsrcs="$modsrcs -module-src \$ngx_addon_dir/$name.c"
@@ -119,7 +123,7 @@ done
 
 # shellcheck disable=SC2086
 "$meta" -s -module "$addon" -I "$here/src" -I "$runtime" $defines $modsrcs \
-    -module-lib -lcrypto -module-lib -lcurl \
+    -module-lib -lcrypto \
     "$here/src/main.c" >"$build/main.log" 2>&1 || {
   say "  FAILED on src/main.c"
   sed -n '1,10p' "$build/main.log"

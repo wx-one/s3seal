@@ -37,7 +37,7 @@ jobs:
 
       - uses: ./.github/actions/meta
         with:
-          image: ${{ vars.META_IMAGE || 'wxone/meta:90db752' }}
+          image: ${{ vars.META_IMAGE || 'wxone/meta:cc24ba0' }}
 
       - name: system packages
         run: |
