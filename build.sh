@@ -43,15 +43,16 @@ binary=${NGINX_BINARY:-$source/objs/nginx}
 # segments deep, and the router splits a path into a fixed number of them -
 # past which a `*key` tail would come back cut short, which is an object
 # quietly stored under the wrong name.
+#
+# META_HTTP_ROUTES is not here: it sizes the `http_t` compiled into meta's
+# runtime archive, so meta fixes it (at 256) and refuses a redefinition.
 defines="-D META_HTTP_SEGMENTS=64 \
          -D META_HTTP_SCRATCH=8192 \
-         -D META_HTTP_HEADERS=64 \
-         -D META_HTTP_ROUTES=64"
+         -D META_HTTP_HEADERS=64"
 
 cdefines="-DMETA_HTTP_SEGMENTS=64 \
           -DMETA_HTTP_SCRATCH=8192 \
-          -DMETA_HTTP_HEADERS=64 \
-          -DMETA_HTTP_ROUTES=64"
+          -DMETA_HTTP_HEADERS=64"
 
 # Every unit but the one with `main` in it. `-module` handles that one,
 # because it has to land in the addon directory under its own name.
@@ -100,7 +101,18 @@ done
 
 # `-module` writes three files: the lowered program, the nginx module around
 # it, and the `config` nginx's --add-dynamic-module reads.
-"$meta" -s -module "$addon" -I "$here/src" -I "$runtime" $defines \
+#
+# It knows only main.c, so the other units are named to it, and so are the
+# libraries they need: meta derives a link line from main.c's own includes,
+# and main.c includes neither OpenSSL nor the fetch client.
+modsrcs=""
+for name in $units; do
+  modsrcs="$modsrcs -module-src \$ngx_addon_dir/$name.c"
+done
+
+# shellcheck disable=SC2086
+"$meta" -s -module "$addon" -I "$here/src" -I "$runtime" $defines $modsrcs \
+    -module-lib -lcrypto -module-lib -lcurl \
     "$here/src/main.c" >"$build/main.log" 2>&1 || {
   say "  FAILED on src/main.c"
   sed -n '1,10p' "$build/main.log"
@@ -113,21 +125,13 @@ done
 
 # ------------------------------------------------------------- the addon config
 #
-# meta writes a config for a program that is one unit and needs libpq. Ours is
-# nine units and needs libcrypto and does not touch postgres, so the three
-# lines that say so are rewritten. Rewritten rather than replaced wholesale,
-# because the parts naming meta's own runtime sources are meta's to change.
+# Two things meta has no flag for: the units' own lowered headers sit in the
+# addon directory, and the `-D` sizes have to reach the C compiler too.
+# Rewritten rather than replaced wholesale, because the rest is meta's.
 
 say "adjusting the addon config"
 
-ours=""
-for name in $units; do
-  ours="$ours \$ngx_addon_dir/$name.c"
-done
-
-awk -v ours="$ours" -v cdefines="$cdefines" '
-  /ngx_module_srcs=/ { sub(/ngx_http_meta_module\.c/, "ngx_http_meta_module.c" ours) }
-  /ngx_module_libs=/ { sub(/-lpq/, "-lcrypto -lcurl") }
+awk -v cdefines="$cdefines" '
   /ngx_module_incs=/ { sub(/"$/, " $ngx_addon_dir\"") }
   /\. auto\/module/  { print "    CFLAGS=\"$CFLAGS " cdefines "\"" }
   { print }
