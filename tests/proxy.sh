@@ -5,8 +5,11 @@
 #
 #   tests/proxy.sh
 #
-# The upstream is a MinIO in a container, started here and stopped on the way
-# out. What is checked is not that the proxy answers - it is that the object
+# The upstream is a MinIO, started here and stopped on the way out: the binary
+# MINIO_BINARY names, or else a container of quay.io/minio/minio - which only
+# works where that image is already pulled, because MinIO has stopped
+# publishing it. CI builds the binary from the release's source instead; see
+# .github/workflows/ci.yml. What is checked is not that the proxy answers - it is that the object
 # on the upstream is *not* the object the client sent, and that the client
 # cannot tell.
 
@@ -55,7 +58,11 @@ skip() {
   exit 0
 }
 
-command -v docker >/dev/null 2>&1 || skip "no docker"
+if [ -n "${MINIO_BINARY:-}" ]; then
+  [ -x "$MINIO_BINARY" ] || skip "no minio at $MINIO_BINARY"
+else
+  command -v docker >/dev/null 2>&1 || skip "no docker"
+fi
 command -v aws >/dev/null 2>&1 || skip "no aws cli"
 [ -x "$binary" ] || skip "no nginx at $binary"
 [ -f "$build/nginx/objs/ngx_http_meta_module.so" ] ||
@@ -68,7 +75,11 @@ mkdir -p "$home"
 stop() {
   [ -f "$home/nginx/logs/meta.pid" ] &&
       kill "$(cat "$home/nginx/logs/meta.pid" 2>/dev/null)" 2>/dev/null
-  docker rm -f "$container" >/dev/null 2>&1
+  if [ -n "${upstreamPid:-}" ]; then
+    kill "$upstreamPid" 2>/dev/null
+  else
+    docker rm -f "$container" >/dev/null 2>&1
+  fi
   sleep 1
   [ -n "${S3SEAL_TEST_KEEP:-}" ] || rm -rf "$work"
 }
@@ -77,11 +88,18 @@ trap stop EXIT
 
 # ------------------------------------------------------------- the upstream
 
-docker rm -f "$container" >/dev/null 2>&1
-
-docker run -d --rm --name "$container" -p "$upstreamPort:9000" \
-    -e MINIO_ROOT_USER=sealtest -e MINIO_ROOT_PASSWORD=sealtest123 \
-    quay.io/minio/minio server /data >/dev/null 2>&1
+if [ -n "${MINIO_BINARY:-}" ]; then
+  mkdir -p "$work/minio"
+  MINIO_ROOT_USER=sealtest MINIO_ROOT_PASSWORD=sealtest123 \
+      "$MINIO_BINARY" server --address "127.0.0.1:$upstreamPort" \
+      "$work/minio" >"$work/minio.log" 2>&1 &
+  upstreamPid=$!
+else
+  docker rm -f "$container" >/dev/null 2>&1
+  docker run -d --rm --name "$container" -p "$upstreamPort:9000" \
+      -e MINIO_ROOT_USER=sealtest -e MINIO_ROOT_PASSWORD=sealtest123 \
+      quay.io/minio/minio server /data >"$work/minio.log" 2>&1
+fi
 
 waited=0
 while [ "$waited" -lt 60 ]; do
@@ -91,7 +109,11 @@ while [ "$waited" -lt 60 ]; do
   waited=$((waited + 1))
 done
 
-[ "$waited" -ge 60 ] && { say "the upstream never came up"; exit 1; }
+[ "$waited" -ge 60 ] && {
+  say "the upstream never came up"
+  sed -n '1,20p' "$work/minio.log"
+  exit 1
+}
 
 say "ok       an upstream S3 is running"
 ran=$((ran + 1))
