@@ -84,9 +84,10 @@ static fetch_call_t trailered(s3seal_proxy_t *self, const char *method,
  * answer so that it also serves `.heard`, where the body is still on its way
  * and there is no answer yet.
  *
- * Every lookup is copied on the spot. `meta_fetchHeaderIn` hands back one
- * buffer per thread and the next call overwrites it, so a header read now and
- * used after another read would quietly be the other one.
+ * Every lookup is used on the spot - copied, or decoded straight out of it.
+ * `meta_fetchHeaderIn` hands back one buffer per thread and the next call
+ * overwrites it, so a header read now and used after another read would
+ * quietly be the other one.
  */
 static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
                            const char *key, const char *head, size_t length,
@@ -94,11 +95,11 @@ static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
 
   char *bound = s3seal_join(bucket, "/", key);
   unsigned char blob[S3SEAL_BLOB];
-  char seal[S3SEAL_BLOB * 2 + 2];
-  char nonce[S3SEAL_NONCE_PREFIX * 2 + 2];
   char mine[S3SEAL_ETAG_MAX];
   unsigned long long plain;
   unsigned long long part;
+  int sealed;
+  int nonced;
 
   memset(into, 0, sizeof *into);
 
@@ -120,8 +121,15 @@ static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
            meta_fetchHeaderIn(head, length, "last-modified"));
   snprintf(into->upstreamEtag, sizeof into->upstreamEtag, "%.63s",
            meta_fetchHeaderIn(head, length, "etag"));
-  snprintf(seal, sizeof seal, "%s",
-           meta_fetchHeaderIn(head, length, "x-amz-meta-seal"));
+
+  /**
+   * The hex is decoded where it lies rather than copied first. A copy into a
+   * buffer the size of a good value is a copy that cuts a bad one short, and
+   * gcc says so; decoding the whole header answers how many bytes it was,
+   * which is the check anyway. Absent is zero bytes.
+   */
+  sealed = s3seal_fromHex(meta_fetchHeaderIn(head, length, "x-amz-meta-seal"),
+                          blob, sizeof blob);
 
   /**
    * No sealing metadata: an object that was in the bucket before we were.
@@ -130,15 +138,15 @@ static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
    * proxy you can put in front of a bucket that already has things in it and
    * one that requires an empty one.
    */
-  if (seal[0] == 0) {
+  if (sealed == 0) {
     into->plain = 1;
     into->how.plain = into->stored;
     snprintf(into->etag, sizeof into->etag, "%.63s", into->upstreamEtag);
     return 0;
   }
 
-  snprintf(nonce, sizeof nonce, "%s",
-           meta_fetchHeaderIn(head, length, "x-amz-meta-nonce"));
+  nonced = s3seal_fromHex(meta_fetchHeaderIn(head, length, "x-amz-meta-nonce"),
+                          into->prefix, S3SEAL_NONCE_PREFIX);
   snprintf(mine, sizeof mine, "%.63s",
            meta_fetchHeaderIn(head, length, "x-amz-meta-etag"));
 
@@ -148,13 +156,12 @@ static int sealFromHeaders(s3seal_proxy_t *self, const char *bucket,
                   10);
 
   /* it answers how many bytes it decoded, and negative for anything else */
-  if (s3seal_fromHex(seal, blob, sizeof blob) != (int)sizeof blob) {
+  if (sealed != (int)sizeof blob) {
     fprintf(stderr, "s3seal: %s/%s has a seal that is not hex\n", bucket, key);
     return -1;
   }
 
-  if (s3seal_fromHex(nonce, into->prefix, S3SEAL_NONCE_PREFIX) !=
-      S3SEAL_NONCE_PREFIX) {
+  if (nonced != S3SEAL_NONCE_PREFIX) {
     fprintf(stderr, "s3seal: %s/%s has a nonce that is not hex\n", bucket, key);
     return -1;
   }
