@@ -196,10 +196,10 @@ typedef struct s3seal_push_t {
   unsigned long long frames;
 
   /**
-   * A batch of frames being gathered, and its sealed form.
+   * The frames being gathered, and their sealed form.
    *
-   * `S3SEAL_BATCH` at a time rather than one, because the handing over
-   * between stages costs more than the sealing does - see s3seal.h.
+   * Room for `S3SEAL_BATCH` of them, of which `sealRun` uses one so far -
+   * see s3seal.h.
    */
   unsigned char gathering[S3SEAL_FRAME * S3SEAL_BATCH];
   size_t fill;
@@ -219,11 +219,10 @@ typedef struct s3seal_push_t {
    *
    * Measured because a 64 MB run said the loop was fine and a 10 GB run said
    * it was half the upstream's speed. Fixed costs hid it; at ten gigabytes
-   * there is nothing left to hide behind, so the three things the loop does
-   * are timed separately rather than argued about.
+   * there is nothing left to hide behind, so how long the loop waits for the
+   * pipe, and how often, is counted rather than argued about.
    */
   double waited;
-  double sealing;
   unsigned long long parks;
 
   /** And where the sealing stage's own time goes: reading, computing, writing. */

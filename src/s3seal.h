@@ -67,9 +67,8 @@
 /**
  * Limits, as an enum rather than as `#define`.
  *
- * The same reason as in LTOS3: a `#define` does not survive lowering into
- * something a debugger or a report can name, and these are numbers that get
- * argued about later.
+ * A `#define` does not survive lowering into something a debugger or a
+ * report can name, and these are numbers that get argued about later.
  */
 enum s3sealLimit {
   /**
@@ -115,21 +114,19 @@ enum s3sealLimit {
   S3SEAL_URL_MAX = 2048,
 
   /**
-   * How many frames the sealing stage takes in one bite.
+   * How many frames the sealing stage is meant to take in one bite.
    *
-   * Four, and the number was found by measuring rather than reasoning.
+   * **Not what it does yet.** `sealRun` in proxy.c still reads, seals and
+   * writes one frame at a time; the commit that measured this sized the
+   * buffers for four and never changed the loop. What was measured:
    *
    * One at a time meant the stage handed over 163,840 times on a ten
-   * gigabyte upload and spent twelve seconds doing nothing else. Sixteen -
-   * which is 1 MiB, and so **exactly the buffer between the stages** - was
-   * barely better: a batch the size of the buffer leaves it always either
-   * full or empty, so both sides take turns standing still.
-   *
-   * Four is a quarter of the buffer, so four bites fit in it and the stage
-   * can work on one while the next is still being drained. That is the whole
-   * trick: what matters is the *ratio* to the buffer, not the size of either.
-   * Growing the buffer to eight megabytes while keeping one frame per bite
-   * changed nothing at all, which is how the ratio was found.
+   * gigabyte upload. Sixteen - which is 1 MiB, and so **exactly the buffer
+   * between the stages** - was barely better: a batch the size of the buffer
+   * leaves it always either full or empty, so both sides take turns standing
+   * still. Four is a quarter of it, so four bites fit and the stage can work
+   * on one while the next is still being drained. What matters is the
+   * *ratio* to the buffer, not the size of either.
    *
    *   1 frame   516 MB/s     write-wait 5.9 s
    *   16        537          4.7

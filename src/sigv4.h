@@ -7,15 +7,13 @@
  * ------------------------------------------------------------------- why
  *
  * Not because AWS compatibility is a goal in itself, but because it is what
- * makes every S3 client that already exists work against LTOS3 without being
+ * makes every S3 client that already exists work through s3seal without being
  * touched - `aws s3 cp`, `rclone`, `mc`, boto3. A token of our own would mean
  * a client of our own.
  *
- * And it is what makes a redirect work. When a master node answers `307` with
- * another node's address, the client signs *again* for the host it is sent
- * to. Nothing is forwarded, nothing is proxied, and the second node checks
- * the second signature itself - which it can, because the nodes share the
- * credentials file and nothing else.
+ * And the client's signature is checked here and ends here. The upstream is
+ * signed to afresh with a key of our own (sign.h), so a client never learns
+ * that key and nothing it sent is forwarded under its name.
  *
  * ---------------------------------------------------------- what is checked
  *

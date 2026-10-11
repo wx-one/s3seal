@@ -104,9 +104,8 @@ int s3seal_bucketOk(const char *name) {
 }
 
 /**
- * Non-empty, under the limit, and nothing that would make it a path we did
- * not mean. A key is never a filename here - the medium path comes out of the
- * metadb - but `..` in a key is the kind of thing that finds a second reader.
+ * Non-empty, under S3's limit, and no control characters - which an XML
+ * listing cannot carry back to the client that chose them.
  */
 int s3seal_keyOk(const char *key) {
 
