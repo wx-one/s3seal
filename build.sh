@@ -110,12 +110,9 @@ done
 # it, and the `config` nginx's --add-dynamic-module reads.
 #
 # It knows only main.c, so the other units are named to it. The link line it
-# works out from all of them: libcurl from meta_fetch.h, which meta knows.
-#
-# libcrypto it is told twice, and only the second one counts yet. frame.c
-# says `#pragma meta needs "-lcrypto"`, but a `-module-src` is read where the
-# module will find it - the *lowered* frame.c in the addon directory - and
-# lowering drops the pragma. Until it keeps it, -module-lib says it again.
+# works out from all of them, lowered as they are: libcurl from meta_fetch.h,
+# which meta knows, and libcrypto from the `#pragma meta needs` in frame.c,
+# which lowering writes back for exactly this.
 modsrcs=""
 for name in $units; do
   modsrcs="$modsrcs -module-src \$ngx_addon_dir/$name.c"
@@ -123,7 +120,6 @@ done
 
 # shellcheck disable=SC2086
 "$meta" -s -module "$addon" -I "$here/src" -I "$runtime" $defines $modsrcs \
-    -module-lib -lcrypto \
     "$here/src/main.c" >"$build/main.log" 2>&1 || {
   say "  FAILED on src/main.c"
   sed -n '1,10p' "$build/main.log"
