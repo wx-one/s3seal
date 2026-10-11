@@ -1422,22 +1422,26 @@ task pushers;
  * The middle stage: plaintext in, sealed frames out.
  *
  * Blocking reads throughout, and that is the point - this thread waiting for
- * a whole frame costs nothing, because the sending thread reads a pipe that
+ * a whole batch costs nothing, because the sending thread reads a pipe that
  * already has bytes in it and never waits for an amount.
+ *
+ * `S3SEAL_BATCH` frames per pass, so the pipes are touched once per batch and
+ * not once per frame. On the wire nothing changes: every frame is still a
+ * chunk of its own.
  */
 static void sealRun(s3seal_push_t *how) {
 
-  for (;;) {
+  while (how->number < how->frames) {
 
+    unsigned long long left = how->frames - how->number;
+    size_t batch = left < S3SEAL_BATCH ? (size_t)left : S3SEAL_BATCH;
     size_t want = (size_t)(how->plain - how->number * S3SEAL_FRAME);
     size_t got = 0;
-    size_t head;
+    size_t total = 0;
 
-    if (how->number >= how->frames)
-      break;
-
-    if (want > S3SEAL_FRAME)
-      want = S3SEAL_FRAME;
+    /* every frame of the batch is whole but perhaps the object's last one */
+    if (want > batch * S3SEAL_FRAME)
+      want = batch * S3SEAL_FRAME;
 
     {
       double at = s3seal_clock();
@@ -1463,30 +1467,41 @@ static void sealRun(s3seal_push_t *how) {
     if (how->broke)
       break;
 
+    /* each frame its own aws-chunked chunk, as one at a time made them */
     {
       double at = s3seal_clock();
 
-    head = (size_t)snprintf((char *)how->out, sizeof how->out, "%zx\r\n",
-                            want + S3SEAL_OVERHEAD);
+      for (size_t one = 0; one < batch; ++one) {
 
-    if (s3seal_sealFrame(how->dataKey, how->prefix, 0,
-                         (unsigned int)how->number,
-                         how->number + 1 == how->frames, how->gathering, want,
-                         how->out + head) != 0) {
-      how->broke = 1;
-      break;
-    }
+        size_t from = one * S3SEAL_FRAME;
+        size_t length = want - from < S3SEAL_FRAME ? want - from : S3SEAL_FRAME;
+        unsigned long long number = how->number + one;
+        unsigned char *into = how->out + total;
+        size_t head = (size_t)snprintf((char *)into, sizeof how->out - total,
+                                       "%zx\r\n", length + S3SEAL_OVERHEAD);
 
-    how->crc = s3seal_crc64(how->out + head, want + S3SEAL_OVERHEAD, how->crc);
+        if (s3seal_sealFrame(how->dataKey, how->prefix, 0,
+                             (unsigned int)number, number + 1 == how->frames,
+                             how->gathering + from, length, into + head) != 0) {
+          how->broke = 1;
+          break;
+        }
 
-    how->out[head + want + S3SEAL_OVERHEAD] = '\r';
-    how->out[head + want + S3SEAL_OVERHEAD + 1] = '\n';
+        how->crc = s3seal_crc64(into + head, length + S3SEAL_OVERHEAD, how->crc);
+
+        into[head + length + S3SEAL_OVERHEAD] = '\r';
+        into[head + length + S3SEAL_OVERHEAD + 1] = '\n';
+
+        total += head + length + S3SEAL_OVERHEAD + 2;
+      }
 
       how->sealWork += s3seal_clock() - at;
     }
 
+    if (how->broke)
+      break;
+
     {
-      size_t total = head + want + S3SEAL_OVERHEAD + 2;
       size_t done = 0;
       double at = s3seal_clock();
 
@@ -1508,7 +1523,7 @@ static void sealRun(s3seal_push_t *how) {
       how->sealWrite += s3seal_clock() - at;
     }
 
-    ++how->number;
+    how->number += batch;
   }
 
   /* the checksum the upstream was told to expect at the end */

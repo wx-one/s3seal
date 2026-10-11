@@ -367,6 +367,13 @@ s3 s3 cp "$work/frame.bin" s3://sealed/frame.bin >/dev/null
 s3 s3 cp s3://sealed/frame.bin "$work/frame.back" >/dev/null
 same "and one that is exactly one frame" "$work/frame.bin" "$work/frame.back"
 
+# five frames and a bit: a whole batch of the sealing stage and then one that
+# is not, ending on a short frame - see S3SEAL_BATCH
+head -c $((5 * 65536 + 1000)) /dev/urandom > "$work/batch.bin"
+s3 s3 cp "$work/batch.bin" s3://sealed/batch.bin >/dev/null
+s3 s3 cp s3://sealed/batch.bin "$work/batch.back" >/dev/null
+same "and one of a batch of frames and a bit" "$work/batch.bin" "$work/batch.back"
+
 # --------------------------------------------------------------- multipart
 #
 # 20 MB with an 8 MiB chunk size, which is what `aws s3 cp` does by itself.

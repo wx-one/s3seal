@@ -114,23 +114,27 @@ enum s3sealLimit {
   S3SEAL_URL_MAX = 2048,
 
   /**
-   * How many frames the sealing stage is meant to take in one bite.
+   * How many frames the sealing stage takes in one bite: read in one go,
+   * sealed one by one, written in one go.
    *
-   * **Not what it does yet.** `sealRun` in proxy.c still reads, seals and
-   * writes one frame at a time; the commit that measured this sized the
-   * buffers for four and never changed the loop. What was measured:
+   * One at a time hands over between the stages once per frame - 163,840
+   * times on a ten gigabyte upload. Four is a quarter of the 1 MiB pipe
+   * between them, so four bites fit and the stage can work on one while the
+   * next is still being drained; a bite the size of the pipe would leave it
+   * always either full or empty, and both sides take turns standing still.
    *
-   * One at a time meant the stage handed over 163,840 times on a ten
-   * gigabyte upload. Sixteen - which is 1 MiB, and so **exactly the buffer
-   * between the stages** - was barely better: a batch the size of the buffer
-   * leaves it always either full or empty, so both sides take turns standing
-   * still. Four is a quarter of it, so four bites fit and the stage can work
-   * on one while the next is still being drained. What matters is the
-   * *ratio* to the buffer, not the size of either.
+   * What it has been measured to do, and not to do: tests/bench.sh 512 with
+   * S3SEAL_ETAG=opaque against MinIO on loopback, five runs each -
    *
-   *   1 frame   516 MB/s     write-wait 5.9 s
-   *   16        537          4.7
-   *   4         629          2.7
+   *   1 frame   535 MB/s (median 539)   5,450 parks on the request side
+   *   4         540 MB/s (median 552)   1,440
+   *
+   * A quarter of the handing over, and no throughput to speak of, because
+   * there the stream already runs at the upstream's own speed: 820 ms of
+   * streaming against 820 ms straight to MinIO. Where the upstream is faster
+   * than the sealing stage it is the handing over that is left; that has not
+   * been measured here. (An earlier note claimed 516 against 629 MB/s for one
+   * against four - from a loop that never took four.)
    */
   S3SEAL_BATCH = 4,
 

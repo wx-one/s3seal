@@ -196,10 +196,9 @@ typedef struct s3seal_push_t {
   unsigned long long frames;
 
   /**
-   * The frames being gathered, and their sealed form.
-   *
-   * Room for `S3SEAL_BATCH` of them, of which `sealRun` uses one so far -
-   * see s3seal.h.
+   * The frames being gathered, and their sealed form, each sealed one with
+   * its own aws-chunked header in front - `S3SEAL_BATCH` at a time, see
+   * s3seal.h.
    */
   unsigned char gathering[S3SEAL_FRAME * S3SEAL_BATCH];
   size_t fill;

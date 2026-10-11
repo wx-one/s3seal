@@ -88,6 +88,15 @@ jobs:
           MINIO_BINARY: ${{ github.workspace }}/minio/minio
         run: tests/proxy.sh
 
+      # the other mode, the one that streams an upload through the sealing
+      # stage instead of holding it whole - see config.h
+      - name: end to end, opaque ETags
+        env:
+          NGINX_BINARY: ${{ github.workspace }}/nginx/objs/nginx
+          MINIO_BINARY: ${{ github.workspace }}/minio/minio
+          S3SEAL_ETAG: opaque
+        run: tests/proxy.sh
+
       - name: what the build said
         if: failure()
         run: |
